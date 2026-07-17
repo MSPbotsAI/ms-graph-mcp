@@ -80,10 +80,11 @@ def create_mcp_server(settings: Settings) -> FastMCP:
 
     client_factory: Callable[[], GraphClient | None] = lambda: get_client_from_context(settings)
 
-    from .tools import groups, licenses, users
+    from .tools import groups, licenses, mail, users
 
     users.register(mcp, client_factory)
     groups.register(mcp, client_factory)
     licenses.register(mcp, client_factory)
+    mail.register(mcp, client_factory)
 
     return mcp
