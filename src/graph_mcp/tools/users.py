@@ -112,3 +112,53 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             return json.dumps(result, indent=2)
         except GraphError as e:
             return f"Error: {e}"
+
+    @mcp.tool()
+    async def graph_reset_password(
+        user_id: str,
+        new_password: str,
+        force_change: bool = True,
+        force_change_with_mfa: bool = False,
+    ) -> str:
+        """Admin-reset an existing Entra ID user's password.
+
+        Sets a temporary password via PATCH /users/{id}; the user is forced to
+        change it at next sign-in (the "walk the user through a password change"
+        flow). Graph returns 204 No Content on success.
+
+        Required Graph scope: User.ReadWrite.All. The calling identity must also
+        hold a Password Administrator or User Administrator directory role;
+        admin/privileged targets may require a higher role such as Privileged
+        Authentication Administrator.
+
+        Args:
+            user_id: The target user's id (GUID) or userPrincipalName (e.g. alice@contoso.com).
+            new_password: Temporary password — must meet the tenant complexity policy.
+            force_change: Force a password change at next sign-in (default True).
+            force_change_with_mfa: Force change at next sign-in and require MFA (default False).
+        """
+        client = client_factory()
+        if client is None:
+            return _NO_TOKEN
+
+        password_profile: dict = {
+            "password": new_password,
+            "forceChangePasswordNextSignIn": force_change,
+        }
+        if force_change_with_mfa:
+            password_profile["forceChangePasswordNextSignInWithMfa"] = True
+
+        body = {"passwordProfile": password_profile}
+
+        try:
+            await client.patch(f"/users/{user_id}", body)
+            return json.dumps(
+                {
+                    "status": "success",
+                    "user_id": user_id,
+                    "message": "Password reset; user must change it at next sign-in.",
+                },
+                indent=2,
+            )
+        except GraphError as e:
+            return f"Error: {e}"
