@@ -3,7 +3,7 @@ from collections.abc import Callable
 
 from mcp.server.fastmcp import FastMCP
 
-from ..api_client import GraphClient, GraphError
+from ..api_client import DEFAULT_BASE_URL, GraphClient, GraphError
 
 _NO_TOKEN = "Error: No Graph access token. Send the X-Ms-Graph-Token header."
 
@@ -158,6 +158,148 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                     "user_id": user_id,
                     "message": "Password reset; user must change it at next sign-in.",
                 },
+                indent=2,
+            )
+        except GraphError as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    async def graph_get_user(user_id: str) -> str:
+        """Read an Entra ID user's full profile, including manager and licenses.
+
+        Use this both to inspect an existing "model" employee whose access profile
+        will be mirrored, and to verify a newly created user is fully provisioned
+        (account enabled, licenses assigned, mailbox/Exchange plan provisioned).
+
+        Required Graph scope: User.Read.All or Directory.Read.All.
+
+        Args:
+            user_id: The target user's id (GUID) or userPrincipalName (e.g. alice@contoso.com).
+        """
+        client = client_factory()
+        if client is None:
+            return _NO_TOKEN
+
+        try:
+            result = await client.get(
+                f"/users/{user_id}",
+                params={
+                    "$select": (
+                        "id,displayName,userPrincipalName,mail,accountEnabled,"
+                        "usageLocation,jobTitle,department,mobilePhone,businessPhones,"
+                        "officeLocation,provisionedPlans,assignedLicenses"
+                    ),
+                    "$expand": "manager($select=id,displayName,userPrincipalName)",
+                },
+            )
+            return json.dumps(result, indent=2)
+        except GraphError as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    async def graph_update_user(
+        user_id: str,
+        usage_location: str | None = None,
+        mobile_phone: str | None = None,
+        business_phones: list[str] | None = None,
+        job_title: str | None = None,
+        department: str | None = None,
+        office_location: str | None = None,
+    ) -> str:
+        """Update attributes on an existing Entra ID user.
+
+        Only the fields you provide are patched; omitted fields are left unchanged.
+        Useful for filling in post-creation details such as the company cellphone
+        number (mobile_phone) or a usage_location that was not set at creation.
+
+        Required Graph scope: User.ReadWrite.All.
+
+        Args:
+            user_id: The target user's id (GUID) or userPrincipalName.
+            usage_location: Two-letter ISO 3166-1 alpha-2 country code (e.g. "US").
+            mobile_phone: Mobile / cellphone number.
+            business_phones: List of business phone numbers.
+            job_title: Job title.
+            department: Department name.
+            office_location: Office location.
+        """
+        client = client_factory()
+        if client is None:
+            return _NO_TOKEN
+
+        body: dict = {}
+        if usage_location is not None:
+            body["usageLocation"] = usage_location
+        if mobile_phone is not None:
+            body["mobilePhone"] = mobile_phone
+        if business_phones is not None:
+            body["businessPhones"] = business_phones
+        if job_title is not None:
+            body["jobTitle"] = job_title
+        if department is not None:
+            body["department"] = department
+        if office_location is not None:
+            body["officeLocation"] = office_location
+
+        if not body:
+            return "Error: Provide at least one attribute to update."
+
+        try:
+            await client.patch(f"/users/{user_id}", body)
+            return json.dumps(
+                {"status": "success", "user_id": user_id, "updated": list(body.keys())},
+                indent=2,
+            )
+        except GraphError as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    async def graph_assign_manager(user_id: str, manager_id: str) -> str:
+        """Set an Entra ID user's manager.
+
+        Required Graph scope: User.ReadWrite.All (and User.Read.All to resolve the
+        manager). Graph returns 204 No Content on success.
+
+        Args:
+            user_id: The target user's id (GUID) or userPrincipalName.
+            manager_id: The manager's user id (GUID) or userPrincipalName.
+        """
+        client = client_factory()
+        if client is None:
+            return _NO_TOKEN
+
+        body = {"@odata.id": f"{DEFAULT_BASE_URL}/users/{manager_id}"}
+
+        try:
+            await client.put(f"/users/{user_id}/manager/$ref", body)
+            return json.dumps(
+                {"status": "success", "user_id": user_id, "manager_id": manager_id},
+                indent=2,
+            )
+        except GraphError as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    async def graph_list_auth_methods(user_id: str) -> str:
+        """List a user's registered Entra ID authentication (MFA) methods.
+
+        Use this to verify a user has completed MFA registration. Note that
+        third-party MFA such as Duo is a separate system and is not reflected here.
+
+        Required Graph scope: UserAuthenticationMethod.Read.All.
+
+        Args:
+            user_id: The target user's id (GUID) or userPrincipalName.
+        """
+        client = client_factory()
+        if client is None:
+            return _NO_TOKEN
+
+        try:
+            result = await client.get(f"/users/{user_id}/authentication/methods")
+            methods = result.get("value", []) if isinstance(result, dict) else []
+            return json.dumps(
+                {"user_id": user_id, "count": len(methods), "methods": methods},
                 indent=2,
             )
         except GraphError as e:

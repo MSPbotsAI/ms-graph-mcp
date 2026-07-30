@@ -30,9 +30,12 @@ class GraphClient:
         return {k: v for k, v in params.items() if v is not None}
 
     async def get(self, path: str, params: dict | None = None) -> Any:
+        # An absolute URL (e.g. an @odata.nextLink page cursor) is used as-is;
+        # a relative path is resolved against the base URL.
+        url = path if path.startswith("http") else f"{self._base_url}{path}"
         async with httpx.AsyncClient() as client:
             resp = await client.get(
-                f"{self._base_url}{path}",
+                url,
                 headers=self._headers(),
                 params=self._clean_params(params),
             )
@@ -60,6 +63,17 @@ class GraphClient:
                 json=body,
             )
             self._raise_for_status(resp)
+            return resp.json() if resp.status_code != 204 else None
+
+    async def put(self, path: str, body: Any = None) -> Any:
+        async with httpx.AsyncClient() as client:
+            resp = await client.put(
+                f"{self._base_url}{path}",
+                headers=self._headers(),
+                json=body,
+            )
+            self._raise_for_status(resp)
+            # PUT /users/{id}/manager/$ref → 204 no body
             return resp.json() if resp.status_code != 204 else None
 
     def _raise_for_status(self, resp: httpx.Response) -> None:
