@@ -53,17 +53,19 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         return json.dumps({"user_id": user_id, "results": results}, indent=2)
 
     @mcp.tool()
-    async def graph_list_user_groups(user_id: str) -> str:
+    async def graph_list_user_groups(user_id: str, max_results: int = 200) -> str:
         """List the groups an Entra ID user is a direct member of.
 
         Use this to read a "model" employee's group memberships so they can be
         mirrored onto a new hire (feed the returned group ids into
-        graph_assign_groups). Results are paginated internally via @odata.nextLink.
+        graph_assign_groups). Results are paginated internally via @odata.nextLink
+        and capped at max_results.
 
         Required Graph scope: GroupMember.Read.All or Directory.Read.All.
 
         Args:
             user_id: The user's id (GUID) or userPrincipalName.
+            max_results: Hard cap on the number of groups returned (default 200).
         """
         client = client_factory()
         if client is None:
@@ -77,11 +79,17 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                     "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
                 },
             )
-            while result:
+            capped = False
+            while result and not capped:
                 for obj in result.get("value", []):
                     # memberOf can also return directoryRoles; keep only groups.
                     if obj.get("@odata.type", "").endswith("group") or "groupTypes" in obj:
                         groups.append(obj)
+                        if len(groups) >= max_results:
+                            capped = True
+                            break
+                if capped:
+                    break
                 next_link = result.get("@odata.nextLink")
                 if not next_link:
                     break
@@ -97,28 +105,31 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     async def graph_list_groups(
         display_name: str | None = None,
         exact: bool = False,
-        top: int = 50,
+        max_results: int = 100,
     ) -> str:
         """List / search Entra ID groups, optionally by display name.
 
         Use this to resolve a human-readable group name to its object id so it can
-        be passed to graph_assign_groups. Results are paginated internally.
+        be passed to graph_assign_groups. Pagination is capped at max_results so an
+        unfiltered call never walks the entire directory (which would time out on a
+        large tenant); narrow the result set with display_name.
 
         Required Graph scope: Group.Read.All or Directory.Read.All.
 
         Args:
             display_name: Filter by display name. Prefix match by default; set
-                exact=True for an exact match. Omit to list all groups.
+                exact=True for an exact match. Omit to list all groups (capped).
             exact: When True, match display_name exactly; otherwise prefix match.
-            top: Page size (Graph max 999); defaults to 50.
+            max_results: Hard cap on the number of groups returned (default 100).
         """
         client = client_factory()
         if client is None:
             return _NO_TOKEN
 
+        page_size = min(max_results, 999)
         params: dict = {
             "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
-            "$top": str(top),
+            "$top": str(page_size),
         }
         if display_name:
             if exact:
@@ -131,6 +142,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             result = await client.get("/groups", params=params)
             while result:
                 groups.extend(result.get("value", []))
+                if len(groups) >= max_results:
+                    groups = groups[:max_results]
+                    break
                 next_link = result.get("@odata.nextLink")
                 if not next_link:
                     break
