@@ -11,10 +11,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
     @mcp.tool()
     async def graph_send_mail(
-        sender_id: str,
         to_recipients: list[str],
         subject: str,
         body: str,
+        sender_id: str | None = None,
         body_content_type: str = "Text",
         cc_recipients: list[str] | None = None,
         bcc_recipients: list[str] | None = None,
@@ -25,10 +25,15 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         Required Graph scope: Mail.Send.
 
         Args:
-            sender_id: Object ID or UPN of the mailbox to send from (e.g. "alice@contoso.com").
             to_recipients: List of To addresses (e.g. ["bob@contoso.com", "carol@contoso.com"]).
             subject: Email subject line.
             body: Email body content.
+            sender_id: Optional mailbox to send from (object ID or UPN, e.g.
+                "alice@contoso.com"). Omit it to send as the signed-in user the
+                current token belongs to — that is the normal case, because the
+                delegated Mail.Send scope only authorizes sending as that user.
+                Sending as a different mailbox also needs Mail.Send.Shared plus
+                send-as rights on it.
             body_content_type: "Text" (default) or "HTML".
             cc_recipients: Optional list of CC addresses.
             bcc_recipients: Optional list of BCC addresses.
@@ -56,8 +61,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             "saveToSentItems": save_to_sent_items,
         }
 
+        # 没给 sender_id 就走 /me——委派令牌下这是唯一被授权的发件人
+        path = f"/users/{sender_id}/sendMail" if sender_id else "/me/sendMail"
+
         try:
-            await client.post(f"/users/{sender_id}/sendMail", payload)
+            await client.post(path, payload)
             return "Mail sent successfully."
         except GraphError as e:
             return f"Error: {e}"
