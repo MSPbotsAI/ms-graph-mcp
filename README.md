@@ -68,13 +68,23 @@ Connect your MCP client with:
 |---|---|---|
 | `graph_check_user_exists` | 按 UPN 或邮箱查询 Entra ID 用户是否存在 | `User.Read.All` / `Directory.Read.All` |
 | `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可 | `User.ReadWrite.All` |
+| `graph_get_user` | 读取用户完整资料，含 manager 与已分配许可 | `User.Read.All` / `Directory.Read.All` |
+| `graph_update_user` | 更新用户属性（仅传入的字段会改动）；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
+| `graph_reset_password` | 管理员重置用户密码，下次登录强制改密 | `User.ReadWrite.All` + Password/User Administrator 角色 |
+| `graph_revoke_sessions` | 注销用户所有登录会话，强制重新登录 | `User.ReadWrite.All` |
+| `graph_assign_manager` | 设置用户的 manager | `User.ReadWrite.All` |
+| `graph_list_auth_methods` | 列出用户已注册的 MFA 认证方式 | `UserAuthenticationMethod.Read.All` |
 | `graph_assign_groups` | 将用户加入一个或多个组，已在组内则幂等跳过 | `GroupMember.ReadWrite.All` / `Group.ReadWrite.All` |
+| `graph_remove_group_member` | 将用户移出一个或多个组，不在组内则幂等跳过 | `GroupMember.ReadWrite.All` / `Group.ReadWrite.All` |
+| `graph_list_user_groups` | 列出用户直接所属的组 | `GroupMember.Read.All` / `Directory.Read.All` |
+| `graph_list_groups` | 按显示名搜索/列出 Entra ID 组 | `Group.Read.All` / `Directory.Read.All` |
 | `graph_check_license_stock` | 查询租户已订阅 SKU 的许可库存与剩余数量 | `Organization.Read.All` |
-| `graph_assign_license` | 为用户分配指定 SKU 许可，可选择禁用部分服务计划 | `User.ReadWrite.All` |
+| `graph_assign_license` | 为用户分配和/或移除指定 SKU 许可（Graph 的 assignLicense 接口一次调用同时支持增删，两者合并进这一个 tool） | `User.ReadWrite.All` |
 | `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC 及 HTML 正文 | `Mail.Send` |
 
-## Typical Workflow
+## Typical Workflows
 
+Onboarding:
 ```
 1. graph_check_user_exists   → 查重，确认账号不存在
 2. graph_create_user         → 建号并设置 usage_location
@@ -83,6 +93,19 @@ Connect your MCP client with:
 5. graph_assign_license      → 配许可
 6. graph_send_mail           → 发送通知邮件（可选）
 ```
+
+Offboarding：
+```
+1. graph_update_user(account_enabled=false) → 立即禁止新登录
+2. graph_revoke_sessions                    → 注销已有会话（旧 token 在到期前仍可能短暂有效，两步搭配才是彻底离职）
+3. graph_assign_license(remove_sku_ids=...) → 收回许可
+4. graph_remove_group_member                → 移出各个组
+```
+
+## Known Gaps
+
+- `graph_remove_group_member`、`graph_revoke_sessions`、`graph_update_user` 的 `account_enabled` 参数、`graph_assign_license` 的 `remove_sku_ids` 参数都是新加的，尚未随真实 Graph 租户测试过——上线前建议先用一个可牺牲的测试账号走一遍完整离职流程再信任。
+- `graph_revoke_sessions` 不是瞬时生效：调用前已签发的 access token 在过期前仍然有效（通常 ~1 小时），所以离职场景务必同时调 `graph_update_user(account_enabled=false)`，不要只调一个。
 
 ## Sovereign Cloud Support
 

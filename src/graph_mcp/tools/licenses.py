@@ -65,30 +65,45 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     @mcp.tool()
     async def graph_assign_license(
         user_id: str,
-        sku_id: str,
+        sku_id: str | None = None,
         disabled_plans: list[str] | None = None,
+        remove_sku_ids: list[str] | None = None,
     ) -> str:
-        """Assign a license SKU to an Entra ID user.
+        """Assign and/or remove license SKUs on an Entra ID user, in one call.
 
-        The user must have usageLocation set (set by graph_create_user).
+        Graph's assignLicense endpoint only accepts a single combined
+        add+remove request per call — you can't add and remove separately,
+        so both are exposed on this one tool. At least one of sku_id or
+        remove_sku_ids must be given. The user must have usageLocation set
+        (set by graph_create_user) before a SKU can be added.
+
         Required Graph scope: User.ReadWrite.All.
 
         Args:
             user_id: Object ID or UPN of the user to license.
-            sku_id: SKU GUID to assign (from graph_check_license_stock).
-            disabled_plans: Optional list of service plan GUIDs to disable within the SKU.
+            sku_id: SKU GUID to add (from graph_check_license_stock). Omit
+                if you're only removing licenses (e.g. offboarding).
+            disabled_plans: Optional list of service plan GUIDs to disable
+                within the SKU being added. Ignored if sku_id is omitted.
+            remove_sku_ids: Optional list of SKU GUIDs to remove from the user.
         """
         client = client_factory()
         if client is None:
             return _NO_TOKEN
 
-        license_entry: dict = {"skuId": sku_id}
-        if disabled_plans:
-            license_entry["disabledPlans"] = disabled_plans
+        if not sku_id and not remove_sku_ids:
+            return "Error: provide sku_id (to add), remove_sku_ids (to remove), or both."
+
+        add_licenses = []
+        if sku_id:
+            license_entry: dict = {"skuId": sku_id}
+            if disabled_plans:
+                license_entry["disabledPlans"] = disabled_plans
+            add_licenses.append(license_entry)
 
         body = {
-            "addLicenses": [license_entry],
-            "removeLicenses": [],
+            "addLicenses": add_licenses,
+            "removeLicenses": remove_sku_ids or [],
         }
 
         try:

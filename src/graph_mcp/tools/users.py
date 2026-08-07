@@ -199,6 +199,7 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     @mcp.tool()
     async def graph_update_user(
         user_id: str,
+        account_enabled: bool | None = None,
         usage_location: str | None = None,
         mobile_phone: str | None = None,
         business_phones: list[str] | None = None,
@@ -212,10 +213,16 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         Useful for filling in post-creation details such as the company cellphone
         number (mobile_phone) or a usage_location that was not set at creation.
 
+        Set account_enabled=False to disable a user's account (e.g. as part of
+        offboarding); this blocks new sign-ins immediately, but any sessions
+        issued before the change stay valid until they expire or are separately
+        revoked with graph_revoke_sessions.
+
         Required Graph scope: User.ReadWrite.All.
 
         Args:
             user_id: The target user's id (GUID) or userPrincipalName.
+            account_enabled: Set False to disable the account, True to re-enable.
             usage_location: Two-letter ISO 3166-1 alpha-2 country code (e.g. "US").
             mobile_phone: Mobile / cellphone number.
             business_phones: List of business phone numbers.
@@ -228,6 +235,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             return _NO_TOKEN
 
         body: dict = {}
+        if account_enabled is not None:
+            body["accountEnabled"] = account_enabled
         if usage_location is not None:
             body["usageLocation"] = usage_location
         if mobile_phone is not None:
@@ -302,5 +311,31 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 {"user_id": user_id, "count": len(methods), "methods": methods},
                 indent=2,
             )
+        except GraphError as e:
+            return f"Error: {e}"
+
+    @mcp.tool()
+    async def graph_revoke_sessions(user_id: str) -> str:
+        """Revoke all of a user's refresh tokens and session cookies,
+        forcing re-authentication on every device and app.
+
+        This invalidates sessions issued before the call; it is not
+        instantaneous for every client (access tokens already issued stay
+        valid until they expire, typically within ~1 hour) — pair with
+        graph_update_user(account_enabled=False) for immediate offboarding
+        so no new sign-in is possible while old tokens age out.
+
+        Required Graph scope: User.ReadWrite.All.
+
+        Args:
+            user_id: Object ID or UPN of the user whose sessions to revoke.
+        """
+        client = client_factory()
+        if client is None:
+            return _NO_TOKEN
+
+        try:
+            await client.post(f"/users/{user_id}/revokeSignInSessions")
+            return json.dumps({"user_id": user_id, "status": "sessions_revoked"}, indent=2)
         except GraphError as e:
             return f"Error: {e}"

@@ -152,3 +152,40 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             return json.dumps({"count": len(groups), "groups": groups}, indent=2)
         except GraphError as e:
             return f"Error: {e}"
+
+    @mcp.tool()
+    async def graph_remove_group_member(
+        user_id: str,
+        group_ids: list[str],
+    ) -> str:
+        """Remove an Entra ID user from one or more groups.
+
+        Required Graph scopes: GroupMember.ReadWrite.All for standard groups;
+        Group.ReadWrite.All for role-assignable groups.
+
+        Processes all group_ids and returns per-group results. Not-a-member
+        errors are treated as success (idempotent) — the end state (user
+        not in the group) is what was asked for either way.
+
+        Args:
+            user_id: Object ID of the user to remove.
+            group_ids: List of group object IDs to remove the user from.
+        """
+        client = client_factory()
+        if client is None:
+            return _NO_TOKEN
+
+        results = []
+
+        for group_id in group_ids:
+            try:
+                await client.delete(f"/groups/{group_id}/members/{user_id}/$ref")
+                results.append({"group_id": group_id, "status": "removed"})
+            except GraphError as e:
+                # Graph returns 404 when the user isn't a member of the group
+                if e.status_code == 404:
+                    results.append({"group_id": group_id, "status": "not_a_member"})
+                else:
+                    results.append({"group_id": group_id, "status": "error", "detail": str(e)})
+
+        return json.dumps({"user_id": user_id, "results": results}, indent=2)

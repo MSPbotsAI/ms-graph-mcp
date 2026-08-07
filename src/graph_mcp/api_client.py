@@ -76,6 +76,12 @@ class GraphClient:
             # PUT /users/{id}/manager/$ref → 204 no body
             return resp.json() if resp.status_code != 204 else None
 
+    async def delete(self, path: str) -> Any:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(f"{self._base_url}{path}", headers=self._headers())
+            self._raise_for_status(resp)
+            return resp.json() if resp.status_code != 204 else None
+
     def _raise_for_status(self, resp: httpx.Response) -> None:
         if resp.status_code >= 400:
             try:
