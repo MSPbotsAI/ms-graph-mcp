@@ -1,10 +1,10 @@
 # graph-mcp
 
-Microsoft Graph MCP server — exposes Azure Entra ID user and license management as MCP tools over HTTP-SSE.
+Microsoft Graph MCP server — exposes Azure Entra ID user, group, and license management plus mail sending as MCP tools over HTTP-SSE, covering the full user onboarding/offboarding lifecycle.
 
 ## Overview
 
-This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) (HTTP-SSE transport) and wraps the Microsoft Graph API. It is designed for **gateway mode**: the caller obtains an Azure access token via OAuth and passes it per-request through a header. The server itself holds no credentials.
+This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) (HTTP-SSE transport) and wraps the Microsoft Graph API. It exposes 15 tools spanning user management (create / read / update / disable, password reset, session revocation, manager assignment, MFA method listing), group membership (add / remove / list / search), license inventory and assignment, and sending mail. It is designed for **gateway mode**: the caller obtains an Azure access token via OAuth and passes it per-request through a header. The server itself holds no credentials.
 
 ## Quick Start
 
