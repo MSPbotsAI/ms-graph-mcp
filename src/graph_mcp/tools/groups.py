@@ -1,37 +1,44 @@
-import json
 from collections.abc import Callable
+from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
+from .._json import dump_json_capped
 from ..api_client import GraphClient, GraphError
-
-_NO_TOKEN = "Error: No Graph access token. Send the X-Ms-Graph-Token header."
+from ._common import NO_TOKEN
 
 _DIRECTORY_OBJECT_URL = "https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
+
+# Our own ceiling on how many results a list tool returns to the agent
+# (SOP: default <=50, hard cap <=200). Separate from Graph's own $top
+# per-page maximum, which is documented at 999 for these endpoints and is
+# used below purely to size individual page requests.
+_DEFAULT_MAX_RESULTS = 50
+_HARD_CAP_MAX_RESULTS = 200
+_GRAPH_TOP_MAX = 999
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
+    )
     async def graph_assign_groups(
-        user_id: str,
-        group_ids: list[str],
+        user_id: Annotated[str, Field(description="Object ID of the user to add.")],
+        group_ids: Annotated[
+            list[str], Field(description="List of group object IDs to add the user to.")
+        ],
     ) -> str:
         """Add an Entra ID user to one or more groups.
 
-        Required Graph scopes: GroupMember.ReadWrite.All for standard groups;
-        Group.ReadWrite.All for role-assignable groups.
-
-        Processes all group_ids and returns per-group results. Already-a-member
-        errors are treated as success (idempotent).
-
-        Args:
-            user_id: Object ID of the user to add.
-            group_ids: List of group object IDs to add the user to.
+        Processes every group_id and returns a per-group result; a user
+        already in a group is treated as success (idempotent).
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         member_url = _DIRECTORY_OBJECT_URL.format(user_id=user_id)
         results = []
@@ -45,31 +52,32 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 results.append({"group_id": group_id, "status": "added"})
             except GraphError as e:
                 # Graph returns 400 when the user is already a member
-                if e.status_code == 400 and "already exist" in str(e).lower():
+                if e.status_code == 400 and "already exist" in str(e.message).lower():
                     results.append({"group_id": group_id, "status": "already_member"})
                 else:
-                    results.append({"group_id": group_id, "status": "error", "detail": str(e)})
+                    results.append(
+                        {"group_id": group_id, "status": "error", "detail": e.message}
+                    )
 
-        return json.dumps({"user_id": user_id, "results": results}, indent=2)
+        return dump_json_capped({"user_id": user_id, "results": results})
 
-    @mcp.tool()
-    async def graph_list_user_groups(user_id: str, max_results: int = 200) -> str:
-        """List the groups an Entra ID user is a direct member of.
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_list_user_groups(
+        user_id: Annotated[str, Field(description="User's id (GUID) or userPrincipalName.")],
+        max_results: Annotated[
+            int, Field(description="Max groups to return (default 50, hard cap 200).")
+        ] = _DEFAULT_MAX_RESULTS,
+    ) -> str:
+        """List the Entra ID groups a user is a direct member of.
 
-        Use this to read a "model" employee's group memberships so they can be
-        mirrored onto a new hire (feed the returned group ids into
-        graph_assign_groups). Results are paginated internally via @odata.nextLink
-        and capped at max_results.
-
-        Required Graph scope: GroupMember.Read.All or Directory.Read.All.
-
-        Args:
-            user_id: The user's id (GUID) or userPrincipalName.
-            max_results: Hard cap on the number of groups returned (default 200).
+        Use to read an existing user's group memberships, e.g. to mirror
+        them onto a new hire via graph_assign_groups.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
+
+        max_results = min(max_results, _HARD_CAP_MAX_RESULTS)
 
         try:
             groups: list = []
@@ -77,6 +85,7 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 f"/users/{user_id}/memberOf",
                 params={
                     "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
+                    "$top": str(min(max_results, _GRAPH_TOP_MAX)),
                 },
             )
             capped = False
@@ -94,39 +103,38 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 if not next_link:
                     break
                 result = await client.get(next_link)
-            return json.dumps(
-                {"user_id": user_id, "count": len(groups), "groups": groups},
-                indent=2,
+            has_more = capped or bool(result and result.get("@odata.nextLink"))
+            return dump_json_capped(
+                {"user_id": user_id, "count": len(groups), "groups": groups, "has_more": has_more}
             )
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
     async def graph_list_groups(
-        display_name: str | None = None,
-        exact: bool = False,
-        max_results: int = 100,
+        display_name: Annotated[
+            str | None,
+            Field(
+                description="Filter by display name; prefix match unless exact=True. Omit to list all groups (still capped by max_results)."
+            ),
+        ] = None,
+        exact: Annotated[
+            bool, Field(description="When True, match display_name exactly instead of by prefix.")
+        ] = False,
+        max_results: Annotated[
+            int, Field(description="Max groups to return (default 50, hard cap 200).")
+        ] = _DEFAULT_MAX_RESULTS,
     ) -> str:
-        """List / search Entra ID groups, optionally by display name.
+        """List or search Entra ID groups by display name.
 
-        Use this to resolve a human-readable group name to its object id so it can
-        be passed to graph_assign_groups. Pagination is capped at max_results so an
-        unfiltered call never walks the entire directory (which would time out on a
-        large tenant); narrow the result set with display_name.
-
-        Required Graph scope: Group.Read.All or Directory.Read.All.
-
-        Args:
-            display_name: Filter by display name. Prefix match by default; set
-                exact=True for an exact match. Omit to list all groups (capped).
-            exact: When True, match display_name exactly; otherwise prefix match.
-            max_results: Hard cap on the number of groups returned (default 100).
+        Use to resolve a group name to its object id for graph_assign_groups.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
-        page_size = min(max_results, 999)
+        max_results = min(max_results, _HARD_CAP_MAX_RESULTS)
+        page_size = min(max_results, _GRAPH_TOP_MAX)
         params: dict = {
             "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
             "$top": str(page_size),
@@ -140,40 +148,38 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         try:
             groups: list = []
             result = await client.get("/groups", params=params)
+            has_more = False
             while result:
                 groups.extend(result.get("value", []))
                 if len(groups) >= max_results:
                     groups = groups[:max_results]
+                    has_more = True
                     break
                 next_link = result.get("@odata.nextLink")
                 if not next_link:
                     break
                 result = await client.get(next_link)
-            return json.dumps({"count": len(groups), "groups": groups}, indent=2)
+            return dump_json_capped({"count": len(groups), "groups": groups, "has_more": has_more})
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
+    )
     async def graph_remove_group_member(
-        user_id: str,
-        group_ids: list[str],
+        user_id: Annotated[str, Field(description="Object ID of the user to remove.")],
+        group_ids: Annotated[
+            list[str], Field(description="List of group object IDs to remove the user from.")
+        ],
     ) -> str:
         """Remove an Entra ID user from one or more groups.
 
-        Required Graph scopes: GroupMember.ReadWrite.All for standard groups;
-        Group.ReadWrite.All for role-assignable groups.
-
-        Processes all group_ids and returns per-group results. Not-a-member
-        errors are treated as success (idempotent) — the end state (user
-        not in the group) is what was asked for either way.
-
-        Args:
-            user_id: Object ID of the user to remove.
-            group_ids: List of group object IDs to remove the user from.
+        Processes every group_id and returns a per-group result; a user not
+        in a group is treated as success (idempotent).
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         results = []
 
@@ -186,6 +192,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 if e.status_code == 404:
                     results.append({"group_id": group_id, "status": "not_a_member"})
                 else:
-                    results.append({"group_id": group_id, "status": "error", "detail": str(e)})
+                    results.append(
+                        {"group_id": group_id, "status": "error", "detail": e.message}
+                    )
 
-        return json.dumps({"user_id": user_id, "results": results}, indent=2)
+        return dump_json_capped({"user_id": user_id, "results": results})

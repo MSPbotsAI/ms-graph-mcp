@@ -1,36 +1,38 @@
-import json
 from collections.abc import Callable
+from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
+from .._json import dump_json_capped, error_envelope
 from ..api_client import DEFAULT_BASE_URL, GraphClient, GraphError
-
-_NO_TOKEN = "Error: No Graph access token. Send the X-Ms-Graph-Token header."
+from ._common import NO_TOKEN
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
     async def graph_check_user_exists(
-        user_principal_name: str | None = None,
-        mail: str | None = None,
+        user_principal_name: Annotated[
+            str | None, Field(description="UPN to search for, e.g. alice@contoso.com.")
+        ] = None,
+        mail: Annotated[
+            str | None, Field(description="Primary SMTP address to search for.")
+        ] = None,
     ) -> str:
         """Check whether an Entra ID user exists by UPN or mail address.
 
-        Exactly one of user_principal_name or mail must be provided.
-        Required Graph scope: User.Read.All or Directory.Read.All.
-
-        Returns {"exists": true/false, "user": object | null}.
-
-        Args:
-            user_principal_name: The UPN to search for (e.g. alice@contoso.com).
-            mail: The primary SMTP address to search for.
+        Exactly one of user_principal_name or mail must be provided. Returns
+        {"exists": true/false, "user": object | null}.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
         if not user_principal_name and not mail:
-            return "Error: Provide either user_principal_name or mail."
+            return error_envelope(
+                "invalid_argument", "Provide either user_principal_name or mail.", False
+            )
 
         if user_principal_name:
             filter_expr = f"userPrincipalName eq '{user_principal_name}'"
@@ -48,44 +50,43 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             )
             users = result.get("value", [])
             if users:
-                return json.dumps({"exists": True, "user": users[0]}, indent=2)
-            return json.dumps({"exists": False, "user": None}, indent=2)
+                return dump_json_capped({"exists": True, "user": users[0]})
+            return dump_json_capped({"exists": False, "user": None})
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=False))
     async def graph_create_user(
-        display_name: str,
-        user_principal_name: str,
-        mail_nickname: str,
-        password: str,
-        usage_location: str,
-        account_enabled: bool = True,
-        given_name: str | None = None,
-        surname: str | None = None,
-        job_title: str | None = None,
-        department: str | None = None,
+        display_name: Annotated[str, Field(description='Full display name, e.g. "Alice Smith".')],
+        user_principal_name: Annotated[
+            str, Field(description='Login UPN, e.g. "alice@contoso.com".')
+        ],
+        mail_nickname: Annotated[
+            str, Field(description='Mail alias without domain, e.g. "alice".')
+        ],
+        password: Annotated[
+            str, Field(description="Initial password; must meet tenant complexity policy.")
+        ],
+        usage_location: Annotated[
+            str,
+            Field(description='Two-letter ISO 3166-1 alpha-2 country code, e.g. "US", "AU", "CN".'),
+        ],
+        account_enabled: Annotated[
+            bool, Field(description="Whether the account is active immediately.")
+        ] = True,
+        given_name: Annotated[str | None, Field(description="First name.")] = None,
+        surname: Annotated[str | None, Field(description="Last name.")] = None,
+        job_title: Annotated[str | None, Field(description="Job title.")] = None,
+        department: Annotated[str | None, Field(description="Department name.")] = None,
     ) -> str:
-        """Create a new Entra ID user.
+        """Create a new Entra ID user account.
 
-        Required Graph scope: User.ReadWrite.All.
-        usage_location is required here because it must be set before assigning licenses.
-
-        Args:
-            display_name: Full display name (e.g. "Alice Smith").
-            user_principal_name: Login UPN (e.g. "alice@contoso.com").
-            mail_nickname: Mail alias without domain (e.g. "alice").
-            password: Initial password — must meet tenant complexity policy.
-            usage_location: Two-letter ISO 3166-1 alpha-2 country code (e.g. "US", "AU", "CN").
-            account_enabled: Whether the account is active immediately (default True).
-            given_name: First name.
-            surname: Last name.
-            job_title: Job title.
-            department: Department name.
+        usage_location is required because it must be set before any license
+        can be assigned to the user.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         body: dict = {
             "displayName": display_name,
@@ -109,37 +110,36 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         try:
             result = await client.post("/users", body)
-            return json.dumps(result, indent=2)
+            return dump_json_capped(result)
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
+    )
     async def graph_reset_password(
-        user_id: str,
-        new_password: str,
-        force_change: bool = True,
-        force_change_with_mfa: bool = False,
+        user_id: Annotated[
+            str, Field(description="Target user's id (GUID) or userPrincipalName.")
+        ],
+        new_password: Annotated[
+            str, Field(description="Temporary password; must meet tenant complexity policy.")
+        ],
+        force_change: Annotated[
+            bool, Field(description="Force a password change at next sign-in.")
+        ] = True,
+        force_change_with_mfa: Annotated[
+            bool, Field(description="Also require MFA at that forced next sign-in.")
+        ] = False,
     ) -> str:
         """Admin-reset an existing Entra ID user's password.
 
-        Sets a temporary password via PATCH /users/{id}; the user is forced to
-        change it at next sign-in (the "walk the user through a password change"
-        flow). Graph returns 204 No Content on success.
-
-        Required Graph scope: User.ReadWrite.All. The calling identity must also
-        hold a Password Administrator or User Administrator directory role;
-        admin/privileged targets may require a higher role such as Privileged
-        Authentication Administrator.
-
-        Args:
-            user_id: The target user's id (GUID) or userPrincipalName (e.g. alice@contoso.com).
-            new_password: Temporary password — must meet the tenant complexity policy.
-            force_change: Force a password change at next sign-in (default True).
-            force_change_with_mfa: Force change at next sign-in and require MFA (default False).
+        The calling identity must additionally hold a Password Administrator
+        or User Administrator directory role (higher-privilege targets may
+        need Privileged Authentication Administrator).
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         password_profile: dict = {
             "password": new_password,
@@ -152,33 +152,31 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         try:
             await client.patch(f"/users/{user_id}", body)
-            return json.dumps(
+            return dump_json_capped(
                 {
                     "status": "success",
                     "user_id": user_id,
                     "message": "Password reset; user must change it at next sign-in.",
-                },
-                indent=2,
+                }
             )
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
-    async def graph_get_user(user_id: str) -> str:
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_get_user(
+        user_id: Annotated[
+            str, Field(description="Target user's id (GUID) or userPrincipalName.")
+        ],
+    ) -> str:
         """Read an Entra ID user's full profile, including manager and licenses.
 
-        Use this both to inspect an existing "model" employee whose access profile
-        will be mirrored, and to verify a newly created user is fully provisioned
-        (account enabled, licenses assigned, mailbox/Exchange plan provisioned).
-
-        Required Graph scope: User.Read.All or Directory.Read.All.
-
-        Args:
-            user_id: The target user's id (GUID) or userPrincipalName (e.g. alice@contoso.com).
+        Use to inspect an existing user's access profile (e.g. before
+        mirroring it onto a new hire), or to verify a newly created user is
+        fully provisioned.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         try:
             result = await client.get(
@@ -192,47 +190,41 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                     "$expand": "manager($select=id,displayName,userPrincipalName)",
                 },
             )
-            return json.dumps(result, indent=2)
+            return dump_json_capped(result)
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
+    )
     async def graph_update_user(
-        user_id: str,
-        account_enabled: bool | None = None,
-        usage_location: str | None = None,
-        mobile_phone: str | None = None,
-        business_phones: list[str] | None = None,
-        job_title: str | None = None,
-        department: str | None = None,
-        office_location: str | None = None,
+        user_id: Annotated[
+            str, Field(description="Target user's id (GUID) or userPrincipalName.")
+        ],
+        account_enabled: Annotated[
+            bool | None,
+            Field(description="Set False to disable the account, True to re-enable."),
+        ] = None,
+        usage_location: Annotated[
+            str | None, Field(description='Two-letter ISO 3166-1 alpha-2 country code, e.g. "US".')
+        ] = None,
+        mobile_phone: Annotated[str | None, Field(description="Mobile/cellphone number.")] = None,
+        business_phones: Annotated[
+            list[str] | None, Field(description="List of business phone numbers.")
+        ] = None,
+        job_title: Annotated[str | None, Field(description="Job title.")] = None,
+        department: Annotated[str | None, Field(description="Department name.")] = None,
+        office_location: Annotated[str | None, Field(description="Office location.")] = None,
     ) -> str:
         """Update attributes on an existing Entra ID user.
 
-        Only the fields you provide are patched; omitted fields are left unchanged.
-        Useful for filling in post-creation details such as the company cellphone
-        number (mobile_phone) or a usage_location that was not set at creation.
-
-        Set account_enabled=False to disable a user's account (e.g. as part of
-        offboarding); this blocks new sign-ins immediately, but any sessions
-        issued before the change stay valid until they expire or are separately
-        revoked with graph_revoke_sessions.
-
-        Required Graph scope: User.ReadWrite.All.
-
-        Args:
-            user_id: The target user's id (GUID) or userPrincipalName.
-            account_enabled: Set False to disable the account, True to re-enable.
-            usage_location: Two-letter ISO 3166-1 alpha-2 country code (e.g. "US").
-            mobile_phone: Mobile / cellphone number.
-            business_phones: List of business phone numbers.
-            job_title: Job title.
-            department: Department name.
-            office_location: Office location.
+        Only the fields you provide are changed. Setting account_enabled=False
+        blocks new sign-ins immediately, but sessions issued before the change
+        stay valid until they expire or are revoked with graph_revoke_sessions.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         body: dict = {}
         if account_enabled is not None:
@@ -251,91 +243,81 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             body["officeLocation"] = office_location
 
         if not body:
-            return "Error: Provide at least one attribute to update."
+            return error_envelope("invalid_argument", "Provide at least one attribute to update.", False)
 
         try:
             await client.patch(f"/users/{user_id}", body)
-            return json.dumps(
-                {"status": "success", "user_id": user_id, "updated": list(body.keys())},
-                indent=2,
+            return dump_json_capped(
+                {"status": "success", "user_id": user_id, "updated": list(body.keys())}
             )
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
-    async def graph_assign_manager(user_id: str, manager_id: str) -> str:
-        """Set an Entra ID user's manager.
-
-        Required Graph scope: User.ReadWrite.All (and User.Read.All to resolve the
-        manager). Graph returns 204 No Content on success.
-
-        Args:
-            user_id: The target user's id (GUID) or userPrincipalName.
-            manager_id: The manager's user id (GUID) or userPrincipalName.
-        """
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
+    )
+    async def graph_assign_manager(
+        user_id: Annotated[str, Field(description="Target user's id (GUID) or userPrincipalName.")],
+        manager_id: Annotated[
+            str, Field(description="Manager's user id (GUID) or userPrincipalName.")
+        ],
+    ) -> str:
+        """Set an Entra ID user's manager."""
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         body = {"@odata.id": f"{DEFAULT_BASE_URL}/users/{manager_id}"}
 
         try:
             await client.put(f"/users/{user_id}/manager/$ref", body)
-            return json.dumps(
-                {"status": "success", "user_id": user_id, "manager_id": manager_id},
-                indent=2,
+            return dump_json_capped(
+                {"status": "success", "user_id": user_id, "manager_id": manager_id}
             )
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
-    async def graph_list_auth_methods(user_id: str) -> str:
-        """List a user's registered Entra ID authentication (MFA) methods.
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_list_auth_methods(
+        user_id: Annotated[str, Field(description="Target user's id (GUID) or userPrincipalName.")],
+    ) -> str:
+        """List a user's registered Entra ID MFA authentication methods.
 
-        Use this to verify a user has completed MFA registration. Note that
-        third-party MFA such as Duo is a separate system and is not reflected here.
-
-        Required Graph scope: UserAuthenticationMethod.Read.All.
-
-        Args:
-            user_id: The target user's id (GUID) or userPrincipalName.
+        Third-party MFA (e.g. Duo) is a separate system and is not reflected
+        here.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         try:
             result = await client.get(f"/users/{user_id}/authentication/methods")
             methods = result.get("value", []) if isinstance(result, dict) else []
-            return json.dumps(
-                {"user_id": user_id, "count": len(methods), "methods": methods},
-                indent=2,
-            )
+            return dump_json_capped({"user_id": user_id, "count": len(methods), "methods": methods})
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()
 
-    @mcp.tool()
-    async def graph_revoke_sessions(user_id: str) -> str:
-        """Revoke all of a user's refresh tokens and session cookies,
-        forcing re-authentication on every device and app.
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
+    )
+    async def graph_revoke_sessions(
+        user_id: Annotated[
+            str, Field(description="Object ID or UPN of the user whose sessions to revoke.")
+        ],
+    ) -> str:
+        """Revoke all of a user's sign-in sessions, forcing re-authentication everywhere.
 
-        This invalidates sessions issued before the call; it is not
-        instantaneous for every client (access tokens already issued stay
-        valid until they expire, typically within ~1 hour) — pair with
-        graph_update_user(account_enabled=False) for immediate offboarding
-        so no new sign-in is possible while old tokens age out.
-
-        Required Graph scope: User.ReadWrite.All.
-
-        Args:
-            user_id: Object ID or UPN of the user whose sessions to revoke.
+        Not instantaneous: access tokens already issued remain valid until
+        they expire (typically ~1 hour). For offboarding, pair with
+        graph_update_user(account_enabled=False) so no new sign-in is
+        possible while old tokens age out.
         """
         client = client_factory()
         if client is None:
-            return _NO_TOKEN
+            return NO_TOKEN
 
         try:
             await client.post(f"/users/{user_id}/revokeSignInSessions")
-            return json.dumps({"user_id": user_id, "status": "sessions_revoked"}, indent=2)
+            return dump_json_capped({"user_id": user_id, "status": "sessions_revoked"})
         except GraphError as e:
-            return f"Error: {e}"
+            return e.to_envelope()

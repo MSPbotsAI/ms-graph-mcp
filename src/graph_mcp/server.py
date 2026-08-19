@@ -75,6 +75,23 @@ def create_mcp_server(settings: Settings) -> FastMCP:
     # correctly behind a reverse proxy or docker network.
     mcp = FastMCP(
         name="graph-mcp",
+        instructions=(
+            "Microsoft Graph is Microsoft's unified API for Entra ID (Azure AD) and "
+            "Microsoft 365 tenant data. This server exposes 4 tool domains modeling "
+            "the identity lifecycle in a tenant: users (create/read/update accounts, "
+            "reset passwords, list MFA methods, assign managers, revoke sessions), "
+            "groups (search/list groups and manage a user's memberships, which drive "
+            "access to Microsoft 365 resources), licenses (check tenant SKU stock and "
+            "assign/remove SKUs on a user — usage_location must be set on the user "
+            "first), and mail (send email as the signed-in user via delegated "
+            "Mail.Send). Typical onboarding: graph_check_user_exists -> "
+            "graph_create_user -> graph_assign_groups -> graph_check_license_stock -> "
+            "graph_assign_license -> graph_send_mail. Typical offboarding: "
+            "graph_update_user(account_enabled=false) -> graph_revoke_sessions -> "
+            "graph_assign_license(remove_sku_ids=...) -> graph_remove_group_member. "
+            "All tools act on the caller's own tenant via a bearer access token "
+            "supplied per-request; there is no cross-tenant access."
+        ),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
