@@ -23,7 +23,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         """Check the tenant's license SKU inventory and remaining availability.
 
         Returns all subscribed SKUs when no filter is given; each includes an
-        available count (prepaid enabled minus consumed).
+        available count (prepaid enabled minus consumed). This is tenant-
+        wide stock, not per-user assignment — to check whether a specific
+        user already has a license, use graph_get_user instead.
         """
         client = client_factory()
         if client is None:
@@ -81,9 +83,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         """Add and/or remove license SKUs on an Entra ID user in a single call.
 
         Microsoft Graph only accepts one combined add+remove request per
-        call, so both directions are exposed here. At least one of sku_id or
-        remove_sku_ids must be given. The user must have usage_location set
-        (via graph_create_user/graph_update_user) before a SKU can be added.
+        call, so both directions are exposed here. Only set the direction
+        actually requested — don't populate remove_sku_ids just because
+        you know the user's current licenses. At least one of sku_id or
+        remove_sku_ids is required; usage_location must already be set
+        before a SKU can be added.
         """
         client = client_factory()
         if client is None:

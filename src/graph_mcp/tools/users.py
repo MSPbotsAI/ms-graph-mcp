@@ -65,7 +65,16 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             str, Field(description='Mail alias without domain, e.g. "alice".')
         ],
         password: Annotated[
-            str, Field(description="Initial password; must meet tenant complexity policy.")
+            str,
+            Field(
+                description=(
+                    "Initial password; must meet tenant complexity policy. "
+                    "Generate a random strong value — never reuse a common/"
+                    "predictable password — since force_change_password is "
+                    "always set, this is a throwaway credential the user "
+                    "changes at first sign-in."
+                )
+            ),
         ],
         usage_location: Annotated[
             str,
@@ -119,7 +128,16 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     )
     async def graph_reset_password(
         user_id: Annotated[
-            str, Field(description="Target user's id (GUID) or userPrincipalName.")
+            str,
+            Field(
+                description=(
+                    "Target user's exact id (GUID) or full userPrincipalName. "
+                    "Never guess this from a first name or partial username — "
+                    "resolve it via graph_check_user_exists/graph_get_user "
+                    "first, and if more than one user could match, ask the "
+                    "user to disambiguate before resetting anyone's password."
+                )
+            ),
         ],
         new_password: Annotated[
             str, Field(description="Temporary password; must meet tenant complexity policy.")
@@ -203,7 +221,14 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         ],
         account_enabled: Annotated[
             bool | None,
-            Field(description="Set False to disable the account, True to re-enable."),
+            Field(
+                description=(
+                    "Set False to disable the account, True to re-enable. "
+                    "This is the primary access-cutoff mechanism for "
+                    "offboarding — confirm the exact user_id before setting "
+                    "False; never guess it from a first name."
+                )
+            ),
         ] = None,
         usage_location: Annotated[
             str | None, Field(description='Two-letter ISO 3166-1 alpha-2 country code, e.g. "US".')
@@ -262,7 +287,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             str, Field(description="Manager's user id (GUID) or userPrincipalName.")
         ],
     ) -> str:
-        """Set an Entra ID user's manager."""
+        """Set an Entra ID user's manager.
+
+        Sets/replaces the manager relationship only — there is no option
+        here to clear a user's manager entirely (not exposed by this tool).
+        """
         client = client_factory()
         if client is None:
             return NO_TOKEN

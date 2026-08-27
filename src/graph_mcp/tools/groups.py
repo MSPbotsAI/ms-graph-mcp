@@ -174,8 +174,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     ) -> str:
         """Remove an Entra ID user from one or more groups.
 
-        Processes every group_id and returns a per-group result; a user not
-        in a group is treated as success (idempotent).
+        Removing a group could cut access to whatever it gates (a shared
+        mailbox, a Teams channel, a SharePoint site) — resolve the real
+        group_id(s) via graph_list_user_groups or graph_list_groups first;
+        never guess one. Processes every group_id and returns a per-group
+        result; a user not in a group is treated as success (idempotent).
         """
         client = client_factory()
         if client is None:

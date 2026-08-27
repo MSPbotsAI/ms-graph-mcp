@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Annotated
+from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -28,7 +28,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 description="Mailbox to send from (object ID or UPN). Omit to send as the token's own signed-in user — the normal case, since delegated Mail.Send only authorizes sending as that user. A different sender additionally needs Mail.Send.Shared and send-as rights."
             ),
         ] = None,
-        body_content_type: Annotated[str, Field(description='"Text" or "HTML".')] = "Text",
+        body_content_type: Annotated[
+            Literal["Text", "HTML"], Field(description='"Text" or "HTML".')
+        ] = "Text",
         cc_recipients: Annotated[
             list[str] | None, Field(description="List of CC addresses.")
         ] = None,
@@ -39,7 +41,12 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             bool, Field(description="Whether to save a copy in Sent Items.")
         ] = True,
     ) -> str:
-        """Send an email as an Entra ID user via Microsoft Graph."""
+        """Send an email as an Entra ID user via Microsoft Graph.
+
+        Irreversible once sent — no unsend. Confirm the exact recipients,
+        subject, and body with the user before calling, especially when
+        sender_id sends as someone other than the caller.
+        """
         client = client_factory()
         if client is None:
             return NO_TOKEN
