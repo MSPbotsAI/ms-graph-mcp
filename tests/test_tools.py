@@ -30,6 +30,7 @@ EXPECTED_TOOLS = {
     "graph_list_user_groups": {"user_id"},
     "graph_list_groups": set(),
     "graph_remove_group_member": {"user_id", "group_ids"},
+    "graph_list_owned_groups": {"user_id"},
     "graph_check_license_stock": set(),
     "graph_assign_license": {"user_id"},
     "graph_send_mail": {"to_recipients", "subject", "body"},
@@ -40,6 +41,8 @@ EXPECTED_TOOLS = {
     "graph_write_file_text": {"drive_id", "item_id", "content"},
     "graph_create_file_text": {"drive_id", "path", "content"},
     "graph_delete_file": {"drive_id", "item_id"},
+    "graph_list_managed_devices": {"user_id"},
+    "graph_remove_managed_device": {"device_id"},
 }
 
 # Tools that are not plain read-only queries (writes / mutations).
@@ -56,6 +59,7 @@ _NON_READ_ONLY = {
     "graph_write_file_text",
     "graph_create_file_text",
     "graph_delete_file",
+    "graph_remove_managed_device",
 }
 
 
@@ -65,11 +69,10 @@ async def test_tools_list_snapshot():
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
     assert names == set(EXPECTED_TOOLS), f"unexpected tool set: {names}"
-    # 22: original <=20 guideline plus graph_create_file_text/graph_delete_file,
-    # added deliberately to give SharePoint scratch-file testing a full
-    # create/write/delete lifecycle without depending on manual SharePoint UI
-    # access (see PRD-17756).
-    assert len(names) <= 22, "tool count should stay within the SOP's <=20 guideline (+2 justified)"
+    # 25: original <=20 guideline, +2 for SharePoint create/delete (PRD-17756),
+    # +3 for graph_list_owned_groups/graph_list_managed_devices/
+    # graph_remove_managed_device (PRD-17403 offboarding tool-gap audit).
+    assert len(names) <= 25, "tool count should stay within the SOP's <=20 guideline (+5 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():

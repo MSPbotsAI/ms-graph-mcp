@@ -18,6 +18,10 @@ _DIRECTORY_OBJECT_URL = "https://graph.microsoft.com/v1.0/directoryObjects/{user
 _DEFAULT_MAX_RESULTS = 50
 _HARD_CAP_MAX_RESULTS = 200
 _GRAPH_TOP_MAX = 999
+# How many of a user's owned groups get an owners-count enrichment call —
+# a departing user realistically owns a handful of groups, not hundreds;
+# this bounds the N+1 fan-out the same way sites.py bounds site enrichment.
+_MAX_OWNED_GROUP_ENRICH = 20
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -163,6 +167,47 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             return dump_json_capped({"count": len(groups), "groups": groups, "has_more": has_more})
         except GraphError as e:
             return e.to_envelope()
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_list_owned_groups(
+        user_id: Annotated[str, Field(description="User's id (GUID) or userPrincipalName.")],
+    ) -> str:
+        """List Entra ID groups a user owns, each enriched with its total
+        owner count.
+
+        Use before offboarding: a group this user owns becomes an
+        ownerless "orphan" group the moment they're removed, unless
+        someone else also owns it. A result with owner_count == 1 means
+        this user is the sole owner — reassign an owner before disabling
+        the account, or flag the group for cleanup.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        try:
+            result = await client.get(
+                f"/users/{user_id}/ownedObjects/microsoft.graph.group",
+                params={"$select": "id,displayName,groupTypes,securityEnabled,mailEnabled"},
+            )
+        except GraphError as e:
+            return e.to_envelope()
+
+        groups = result.get("value", []) if isinstance(result, dict) else []
+        for group in groups[:_MAX_OWNED_GROUP_ENRICH]:
+            try:
+                owners = await client.get(
+                    f"/groups/{group['id']}/owners", params={"$select": "id"}
+                )
+                group["owner_count"] = (
+                    len(owners.get("value", [])) if isinstance(owners, dict) else None
+                )
+            except GraphError:
+                # Enrichment failing (e.g. a transient error on one group)
+                # shouldn't fail the whole list — leave owner_count unset.
+                group["owner_count"] = None
+
+        return dump_json_capped({"user_id": user_id, "count": len(groups), "groups": groups})
 
     @mcp.tool(
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)

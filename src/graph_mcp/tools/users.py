@@ -190,7 +190,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         Use to inspect an existing user's access profile (e.g. before
         mirroring it onto a new hire), or to verify a newly created user is
-        fully provisioned.
+        fully provisioned. licenseAssignmentStates[].assignedByGroup: null
+        means a license is assigned directly (needs manual removal);
+        non-null means group-based (clears once removed from that group).
         """
         client = client_factory()
         if client is None:
@@ -203,7 +205,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                     "$select": (
                         "id,displayName,userPrincipalName,mail,accountEnabled,"
                         "usageLocation,jobTitle,department,mobilePhone,businessPhones,"
-                        "officeLocation,provisionedPlans,assignedLicenses"
+                        "officeLocation,provisionedPlans,assignedLicenses,"
+                        "licenseAssignmentStates"
                     ),
                     "$expand": "manager($select=id,displayName,userPrincipalName)",
                 },
