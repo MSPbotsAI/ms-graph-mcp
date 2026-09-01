@@ -85,9 +85,11 @@ Connect your MCP client with:
 | `graph_list_drive_items` | 列出文档库根目录或某个文件夹下的文件/文件夹（不递归） | `Sites.Read.All` / `Files.Read.All` |
 | `graph_get_file` | 获取文件元数据（名称/大小/MIME类型）+ 一个临时的预授权直接下载链接 | `Sites.Read.All` / `Files.Read.All` |
 | `graph_read_file_text` | 读取小体积纯文本文件（.txt/.md/.csv/.json等）的实际内容，超过200,000字节或非UTF-8可解码（即二进制Office文档）会拒绝并提示改用 downloadUrl | `Sites.Read.All` / `Files.Read.All` |
-| `graph_write_file_text` | 整篇覆盖一个已存在的纯文本文件内容（非patch，必须传完整内容），目标文件当前MIME类型看着不像文本会拒绝写入 | `Sites.ReadWrite.All` / `Files.ReadWrite.All` |
-| `graph_create_file_text` | 在指定路径新建一个纯文本文件；**如果该路径已存在文件会直接报错拒绝**，绝不会静默覆盖——要覆盖已有文件用 `graph_write_file_text` | `Sites.ReadWrite.All` / `Files.ReadWrite.All` |
-| `graph_delete_file` | 永久删除一个文件（进站点回收站，跟SharePoint网页里删除等效）；幂等，删一个已经不存在的item id也返回成功 | `Sites.ReadWrite.All` / `Files.ReadWrite.All` |
+| `graph_write_file_text` | 整篇覆盖一个已存在的纯文本文件内容（非patch，必须传完整内容），目标文件当前MIME类型看着不像文本会拒绝写入 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
+| `graph_create_file_text` | 在指定路径新建一个纯文本文件；**如果该路径已存在文件会直接报错拒绝**，绝不会静默覆盖——要覆盖已有文件用 `graph_write_file_text` | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
+| `graph_delete_file` | 永久删除一个文件（进站点回收站，跟SharePoint网页里删除等效）；幂等，删一个已经不存在的item id也返回成功 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
+
+> **权限说明**：本文件里所有 SharePoint 工具全部只调用 Graph 的 `/sites/*` 和 `/drives/*` 端点，从不触碰 `/me/drive` 或 `/users/{id}/drive`。这类站点文档库驱动器接口，`Sites.*` 和 `Files.*` 是二选一的替代权限组，不是叠加要求——所以只需要 `Sites.Read.All`（只读工具）+ `Sites.ReadWrite.All`（写/建/删工具），完全不需要额外申请 `Files.ReadWrite.All`。
 
 ## Typical Workflows
 
