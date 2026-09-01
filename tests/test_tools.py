@@ -38,6 +38,8 @@ EXPECTED_TOOLS = {
     "graph_get_file": {"drive_id", "item_id"},
     "graph_read_file_text": {"drive_id", "item_id"},
     "graph_write_file_text": {"drive_id", "item_id", "content"},
+    "graph_create_file_text": {"drive_id", "path", "content"},
+    "graph_delete_file": {"drive_id", "item_id"},
 }
 
 # Tools that are not plain read-only queries (writes / mutations).
@@ -52,6 +54,8 @@ _NON_READ_ONLY = {
     "graph_assign_license",
     "graph_send_mail",
     "graph_write_file_text",
+    "graph_create_file_text",
+    "graph_delete_file",
 }
 
 
@@ -61,7 +65,11 @@ async def test_tools_list_snapshot():
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
     assert names == set(EXPECTED_TOOLS), f"unexpected tool set: {names}"
-    assert len(names) <= 20, "tool count should stay within the SOP's <=20 guideline"
+    # 22: original <=20 guideline plus graph_create_file_text/graph_delete_file,
+    # added deliberately to give SharePoint scratch-file testing a full
+    # create/write/delete lifecycle without depending on manual SharePoint UI
+    # access (see PRD-17756).
+    assert len(names) <= 22, "tool count should stay within the SOP's <=20 guideline (+2 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():

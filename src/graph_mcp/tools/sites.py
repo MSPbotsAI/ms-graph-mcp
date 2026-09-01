@@ -1,15 +1,21 @@
 """SharePoint site/document tools (Microsoft Graph Sites & Drives APIs).
 
 Scope note: these tools cover TEXT-based files only (.txt/.md/.csv/.json and
-similar) — reading decodes content as UTF-8, writing rejects anything that
-doesn't already look like a text file. Binary Office documents (.docx/.xlsx/
-.pdf) are deliberately out of scope: reading one back as inline tool output
-would mean stuffing a base64-encoded blob through the calling agent's own
-context window, which this fleet's tools cap around 20,000 characters —
-workable for a short text file, not for a multi-hundred-KB document.
-graph_get_file's returned downloadUrl is the escape hatch for binary
-content: a pre-authenticated, time-limited direct link a caller can fetch
-independently of this MCP's own response-size limits.
+similar) — reading decodes content as UTF-8, writing/creating rejects
+anything that doesn't already look like a text file. Binary Office
+documents (.docx/.xlsx/.pdf) are deliberately out of scope: reading one
+back as inline tool output would mean stuffing a base64-encoded blob
+through the calling agent's own context window, which this fleet's tools
+cap around 20,000 characters — workable for a short text file, not for a
+multi-hundred-KB document. graph_get_file's returned downloadUrl is the
+escape hatch for binary content: a pre-authenticated, time-limited direct
+link a caller can fetch independently of this MCP's own response-size
+limits. create/write/delete are split into three separate tools rather
+than one upsert-style tool, deliberately: graph_create_file_text fails if
+something already exists at the path (never silently overwrites),
+graph_write_file_text only ever targets an existing item id (never
+silently creates), and graph_delete_file is the one place anything is
+permanently removed.
 """
 
 from collections.abc import Callable
@@ -218,7 +224,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         ],
     ) -> str:
         """Overwrite an EXISTING text file's entire content (.txt/.md/
-        .csv/.json). No "create a new file" tool exists in this server.
+        .csv/.json). For a path that doesn't exist yet, use
+        graph_create_file_text — this tool refuses to guess.
 
         Use for "update review-notes.md with these findings", "save my
         edits to that file". Whole-document write, not a patch/append: the
@@ -261,3 +268,103 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             return dump_json_capped(result)
         except GraphError as e:
             return e.to_envelope()
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=False))
+    async def graph_create_file_text(
+        drive_id: Annotated[str, Field(description="Document library's drive id.")],
+        path: Annotated[
+            str,
+            Field(
+                description='Full path from the library root, e.g. "notes.md" or '
+                '"Scratch/test-file.txt" — parent folders in the path must already '
+                "exist. Extension must be .txt/.md/.csv/.json."
+            ),
+        ],
+        content: Annotated[
+            str,
+            Field(
+                description=f"Initial content (UTF-8 text), up to {_MAX_WRITE_BYTES:,} "
+                "bytes encoded."
+            ),
+        ],
+    ) -> str:
+        """Create a NEW text file (.txt/.md/.csv/.json) at a path that
+        doesn't exist yet.
+
+        Use for "create a new scratch file with this content", "add a
+        notes.md to that folder". Fails (clear error) if something already
+        exists at that exact path — this tool never silently overwrites;
+        use graph_write_file_text for an existing file instead. To remove
+        a file created this way, use graph_delete_file.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+        if not any(path.lower().endswith(ext) for ext in (".txt", ".md", ".csv", ".json")):
+            return error_envelope(
+                "invalid_argument",
+                "path must end in .txt, .md, .csv, or .json — this tool only creates "
+                "plain-text files.",
+                False,
+            )
+        encoded = content.encode("utf-8")
+        if len(encoded) > _MAX_WRITE_BYTES:
+            return error_envelope(
+                "invalid_argument",
+                f"Content is {len(encoded):,} bytes, over this tool's "
+                f"{_MAX_WRITE_BYTES:,}-byte limit.",
+                False,
+            )
+        try:
+            await client.get(f"/drives/{drive_id}/root:/{path}:")
+        except GraphError as e:
+            if e.status_code != 404:
+                return e.to_envelope()
+            # 404 is the expected/good case here — nothing at this path yet.
+        else:
+            return error_envelope(
+                "invalid_argument",
+                f"A file already exists at \"{path}\" — use graph_write_file_text to "
+                "overwrite it, or pick a different path.",
+                False,
+            )
+        try:
+            result = await client.put_content(
+                f"/drives/{drive_id}/root:/{path}:/content",
+                encoded,
+                content_type="text/plain; charset=utf-8",
+            )
+            return dump_json_capped(result)
+        except GraphError as e:
+            return e.to_envelope()
+
+    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
+    async def graph_delete_file(
+        drive_id: Annotated[str, Field(description="Document library's drive id.")],
+        item_id: Annotated[
+            str,
+            Field(
+                description="File's item id to delete permanently, from "
+                "graph_list_drive_items/graph_get_file/graph_create_file_text's result."
+            ),
+        ],
+    ) -> str:
+        """Permanently delete a file (moves it to the site's recycle bin,
+        same as deleting it in the SharePoint UI — recoverable there for a
+        limited time, but gone from this MCP's view immediately).
+
+        Use for "delete that scratch file", "remove the test file I just
+        made" — confirm the exact file with the user before calling on
+        anything that wasn't clearly created for throwaway/test purposes.
+        Idempotent: deleting an already-deleted item id returns success,
+        not an error.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+        try:
+            await client.delete(f"/drives/{drive_id}/items/{item_id}")
+        except GraphError as e:
+            if e.status_code != 404:
+                return e.to_envelope()
+        return dump_json_capped({"driveId": drive_id, "itemId": item_id, "deleted": True})
