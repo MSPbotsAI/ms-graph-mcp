@@ -115,3 +115,53 @@ def test_error_envelope_mapping(status_code, expected_code, expected_retryable):
     assert envelope["error"]["code"] == expected_code
     assert envelope["error"]["retryable"] is expected_retryable
     assert envelope["error"]["message"] == "boom"
+
+
+class _CapturingClient:
+    """Minimal GraphClient stand-in that records the request instead of making it."""
+
+    def __init__(self, result: dict | None = None):
+        self.calls: list[tuple[str, dict]] = []
+        self._result = result if result is not None else {"value": []}
+
+    async def get(self, path: str, params: dict | None = None) -> dict:
+        self.calls.append((path, params or {}))
+        return self._result
+
+
+def _register(module) -> tuple[object, _CapturingClient]:
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP(name="test")
+    client = _CapturingClient()
+    module.register(mcp, lambda: client)
+    return mcp, client
+
+
+@pytest.mark.asyncio
+async def test_user_lookup_escapes_apostrophe():
+    """An apostrophe in a UPN must be doubled, not left to close the OData literal
+    early — o'brien@contoso.com is a real name shape, and unescaped it turns the
+    whole $filter into a 400."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_check_user_exists", {"user_principal_name": "o'brien@contoso.com"})
+    assert client.calls[0][1]["$filter"] == "userPrincipalName eq 'o''brien@contoso.com'"
+
+    client.calls.clear()
+    await mcp.call_tool("graph_check_user_exists", {"mail": "o'brien@contoso.com"})
+    assert client.calls[0][1]["$filter"] == "mail eq 'o''brien@contoso.com'"
+
+
+@pytest.mark.asyncio
+async def test_group_search_escapes_apostrophe():
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    await mcp.call_tool("graph_list_groups", {"display_name": "Bob's Team", "exact": True})
+    assert client.calls[0][1]["$filter"] == "displayName eq 'Bob''s Team'"
+
+    client.calls.clear()
+    await mcp.call_tool("graph_list_groups", {"display_name": "Bob's Team"})
+    assert client.calls[0][1]["$filter"] == "startswith(displayName,'Bob''s Team')"

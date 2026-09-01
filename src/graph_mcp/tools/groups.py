@@ -7,7 +7,7 @@ from pydantic import Field
 
 from .._json import dump_json_capped
 from ..api_client import GraphClient, GraphError
-from ._common import NO_TOKEN
+from ._common import NO_TOKEN, odata_quote
 
 _DIRECTORY_OBJECT_URL = "https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
 
@@ -140,10 +140,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             "$top": str(page_size),
         }
         if display_name:
+            quoted = odata_quote(display_name)
             if exact:
-                params["$filter"] = f"displayName eq '{display_name}'"
+                params["$filter"] = f"displayName eq '{quoted}'"
             else:
-                params["$filter"] = f"startswith(displayName,'{display_name}')"
+                params["$filter"] = f"startswith(displayName,'{quoted}')"
 
         try:
             groups: list = []

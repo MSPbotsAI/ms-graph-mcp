@@ -7,7 +7,7 @@ from pydantic import Field
 
 from .._json import dump_json_capped, error_envelope
 from ..api_client import DEFAULT_BASE_URL, GraphClient, GraphError
-from ._common import NO_TOKEN
+from ._common import NO_TOKEN, odata_quote
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -35,9 +35,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             )
 
         if user_principal_name:
-            filter_expr = f"userPrincipalName eq '{user_principal_name}'"
+            filter_expr = f"userPrincipalName eq '{odata_quote(user_principal_name)}'"
         else:
-            filter_expr = f"mail eq '{mail}'"
+            filter_expr = f"mail eq '{odata_quote(mail)}'"
 
         try:
             result = await client.get(

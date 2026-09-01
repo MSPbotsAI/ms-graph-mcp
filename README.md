@@ -66,30 +66,44 @@ Connect your MCP client with:
 
 | Tool | 功能 | Required Scope |
 |---|---|---|
-| `graph_check_user_exists` | 按 UPN 或邮箱查询 Entra ID 用户是否存在 | `User.Read.All` / `Directory.Read.All` |
+| `graph_check_user_exists` | 按 UPN 或邮箱查询 Entra ID 用户是否存在 | `User.Read.All` |
 | `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可 | `User.ReadWrite.All` |
-| `graph_get_user` | 读取用户完整资料，含 manager 与已分配许可 | `User.Read.All` / `Directory.Read.All` |
+| `graph_get_user` | 读取用户完整资料，含 manager 与已分配许可 | `User.Read.All` |
 | `graph_update_user` | 更新用户属性（仅传入的字段会改动）；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
 | `graph_reset_password` | 管理员重置用户密码，下次登录强制改密 | `User.ReadWrite.All` + Password/User Administrator 角色 |
 | `graph_revoke_sessions` | 注销用户所有登录会话，强制重新登录 | `User.ReadWrite.All` |
 | `graph_assign_manager` | 设置用户的 manager | `User.ReadWrite.All` |
 | `graph_list_auth_methods` | 列出用户已注册的 MFA 认证方式 | `UserAuthenticationMethod.Read.All` |
-| `graph_assign_groups` | 将用户加入一个或多个组，已在组内则幂等跳过 | `GroupMember.ReadWrite.All` / `Group.ReadWrite.All` |
-| `graph_remove_group_member` | 将用户移出一个或多个组，不在组内则幂等跳过 | `GroupMember.ReadWrite.All` / `Group.ReadWrite.All` |
-| `graph_list_user_groups` | 列出用户直接所属的组 | `GroupMember.Read.All` / `Directory.Read.All` |
-| `graph_list_groups` | 按显示名搜索/列出 Entra ID 组 | `Group.Read.All` / `Directory.Read.All` |
+| `graph_assign_groups` | 将用户加入一个或多个组，已在组内则幂等跳过 | `GroupMember.ReadWrite.All` |
+| `graph_remove_group_member` | 将用户移出一个或多个组，不在组内则幂等跳过 | `GroupMember.ReadWrite.All` |
+| `graph_list_user_groups` | 列出用户直接所属的组 | `GroupMember.Read.All`（注意：`GroupMember.ReadWrite.All` 不在该端点的受理列表里，必须单独申请 Read 版） |
+| `graph_list_groups` | 按显示名搜索/列出 Entra ID 组 | `Group.Read.All` |
 | `graph_check_license_stock` | 查询租户已订阅 SKU 的许可库存与剩余数量 | `Organization.Read.All` |
 | `graph_assign_license` | 为用户分配和/或移除指定 SKU 许可（Graph 的 assignLicense 接口一次调用同时支持增删，两者合并进这一个 tool） | `User.ReadWrite.All` |
-| `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC 及 HTML 正文 | `Mail.Send` |
+| `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC 及 HTML 正文 | `Mail.Send`；带 `sender_id`（代他人/共享邮箱发信）另需 `Mail.Send.Shared` |
 | `graph_search_sites` | 按名称/关键词搜索 SharePoint 站点，结果自动带出每个站点默认文档库的 driveId（最多补前5条） | `Sites.Read.All` |
-| `graph_list_drive_items` | 列出文档库根目录或某个文件夹下的文件/文件夹（不递归） | `Sites.Read.All` / `Files.Read.All` |
-| `graph_get_file` | 获取文件元数据（名称/大小/MIME类型）+ 一个临时的预授权直接下载链接 | `Sites.Read.All` / `Files.Read.All` |
-| `graph_read_file_text` | 读取小体积纯文本文件（.txt/.md/.csv/.json等）的实际内容，超过200,000字节或非UTF-8可解码（即二进制Office文档）会拒绝并提示改用 downloadUrl | `Sites.Read.All` / `Files.Read.All` |
+| `graph_list_drive_items` | 列出文档库根目录或某个文件夹下的文件/文件夹（不递归） | `Sites.Read.All` |
+| `graph_get_file` | 获取文件元数据（名称/大小/MIME类型）+ 一个临时的预授权直接下载链接 | `Sites.Read.All` |
+| `graph_read_file_text` | 读取小体积纯文本文件（.txt/.md/.csv/.json等）的实际内容，超过200,000字节或非UTF-8可解码（即二进制Office文档）会拒绝并提示改用 downloadUrl | `Sites.Read.All` |
 | `graph_write_file_text` | 整篇覆盖一个已存在的纯文本文件内容（非patch，必须传完整内容），目标文件当前MIME类型看着不像文本会拒绝写入 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_create_file_text` | 在指定路径新建一个纯文本文件；**如果该路径已存在文件会直接报错拒绝**，绝不会静默覆盖——要覆盖已有文件用 `graph_write_file_text` | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_delete_file` | 永久删除一个文件（进站点回收站，跟SharePoint网页里删除等效）；幂等，删一个已经不存在的item id也返回成功 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 
 > **权限说明**：本文件里所有 SharePoint 工具全部只调用 Graph 的 `/sites/*` 和 `/drives/*` 端点，从不触碰 `/me/drive` 或 `/users/{id}/drive`。这类站点文档库驱动器接口，`Sites.*` 和 `Files.*` 是二选一的替代权限组，不是叠加要求——所以只需要 `Sites.Read.All`（只读工具）+ `Sites.ReadWrite.All`（写/建/删工具），完全不需要额外申请 `Files.ReadWrite.All`。
+
+> **实际申请的 scope**：上表逐个工具列的是各端点**最小**受理权限，便于按需裁剪；平台侧（MCP-Management-Service 的 `auth/oauth/vendors/msgraph.py`）实际向 Entra 申请的是能覆盖全部 22 个工具的并集：
+>
+> ```
+> offline_access openid profile
+> User.ReadWrite.All UserAuthenticationMethod.Read.All
+> Group.Read.All GroupMember.Read.All GroupMember.ReadWrite.All
+> Organization.Read.All Mail.Send Mail.Send.Shared
+> Sites.ReadWrite.All Files.Read.All Files.ReadWrite.All
+> ```
+>
+> 其中 `User.ReadWrite.All` 覆盖建/改用户、改密、分配许可、注销会话（这些端点各自的最小权限分散在 `User-PasswordProfile.ReadWrite.All`、`User.EnableDisableAccount.All`、`LicenseAssignment.ReadWrite.All`、`User.RevokeSessions.All`，用一条覆盖比申请五条更诚实）；`Sites.ReadWrite.All` 包含 `Sites.Read.All` 故不重复列；**不申请** `Directory.Read.All`（没有工具需要通读目录）和 `Group.ReadWrite.All`（没有工具建组/删组/改组属性）。
+>
+> `Files.Read.All` / `Files.ReadWrite.All` 是运维决定一并申请的：如上一条所述，对本文件用到的 `/sites/*`、`/drives/*` 端点，`Files.*` 与 `Sites.*` 是**二选一**的替代权限组，工具本身不需要它——加上是为了让"管理员只同意了其中一组"的租户也能落到可用状态。代价是 `Files.*` 同时覆盖每个用户的 OneDrive，而这里没有任何工具会去碰它。
 
 ## Typical Workflows
 
