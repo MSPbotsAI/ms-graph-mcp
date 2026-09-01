@@ -55,7 +55,15 @@ class GraphError(Exception):
 
     def to_envelope(self) -> str:
         code, retryable = _classify(self.status_code)
-        return error_envelope(code, self.message, retryable)
+        # TEMP DEBUG (PRD-17756): surface the raw Graph HTTP status so we can
+        # tell a 401 (bad token) from a 403 (insufficient scope / site access
+        # policy) apart — _classify collapses both into "unauthorized".
+        # Revert this once the write-permission root cause is confirmed.
+        import json
+
+        envelope = json.loads(error_envelope(code, self.message, retryable))
+        envelope["error"]["debug_status_code"] = self.status_code
+        return json.dumps(envelope, separators=(",", ":"), ensure_ascii=False)
 
 
 class GraphClient:
