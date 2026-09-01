@@ -33,6 +33,11 @@ EXPECTED_TOOLS = {
     "graph_check_license_stock": set(),
     "graph_assign_license": {"user_id"},
     "graph_send_mail": {"to_recipients", "subject", "body"},
+    "graph_search_sites": {"query"},
+    "graph_list_drive_items": {"drive_id"},
+    "graph_get_file": {"drive_id", "item_id"},
+    "graph_read_file_text": {"drive_id", "item_id"},
+    "graph_write_file_text": {"drive_id", "item_id", "content"},
 }
 
 # Tools that are not plain read-only queries (writes / mutations).
@@ -46,6 +51,7 @@ _NON_READ_ONLY = {
     "graph_remove_group_member",
     "graph_assign_license",
     "graph_send_mail",
+    "graph_write_file_text",
 }
 
 

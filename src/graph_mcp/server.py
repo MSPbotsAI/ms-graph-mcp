@@ -77,7 +77,7 @@ def create_mcp_server(settings: Settings) -> FastMCP:
         name="graph-mcp",
         instructions=(
             "Microsoft Graph is Microsoft's unified API for Entra ID (Azure AD) and "
-            "Microsoft 365 tenant data. This server exposes 4 tool domains modeling "
+            "Microsoft 365 tenant data. This server exposes 5 tool domains modeling "
             "the identity lifecycle in a tenant: users (create/read/update accounts, "
             "reset passwords, list MFA methods, assign managers, revoke sessions), "
             "groups (search/list groups and manage a user's memberships, which drive "
@@ -89,19 +89,25 @@ def create_mcp_server(settings: Settings) -> FastMCP:
             "graph_assign_license -> graph_send_mail. Typical offboarding: "
             "graph_update_user(account_enabled=false) -> graph_revoke_sessions -> "
             "graph_assign_license(remove_sku_ids=...) -> graph_remove_group_member. "
-            "All tools act on the caller's own tenant via a bearer access token "
-            "supplied per-request; there is no cross-tenant access."
+            "A 5th domain, sites, reads/writes SharePoint document libraries: "
+            "graph_search_sites -> graph_list_drive_items -> graph_read_file_text "
+            "for small text files (.txt/.md/.csv/.json), or graph_get_file's "
+            "downloadUrl for anything larger/binary, which this server cannot "
+            "read/write directly. All tools act on the caller's own tenant via "
+            "a bearer access token supplied per-request; there is no "
+            "cross-tenant access."
         ),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
     client_factory: Callable[[], GraphClient | None] = lambda: get_client_from_context(settings)
 
-    from .tools import groups, licenses, mail, users
+    from .tools import groups, licenses, mail, sites, users
 
     users.register(mcp, client_factory)
     groups.register(mcp, client_factory)
     licenses.register(mcp, client_factory)
     mail.register(mcp, client_factory)
+    sites.register(mcp, client_factory)
 
     return mcp

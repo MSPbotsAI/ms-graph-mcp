@@ -96,21 +96,50 @@ class GraphClient:
     async def delete(self, path: str) -> Any:
         return await self._request("DELETE", path)
 
+    async def get_content(self, path: str) -> bytes:
+        """Fetch a drive item's raw `/content` bytes — not JSON, so this
+        bypasses _parse_body entirely. Used for reading file content, where
+        the response body IS the file, not a Graph resource envelope.
+        """
+        return await self._request("GET", path, raw=True)
+
+    async def put_content(self, path: str, data: bytes, content_type: str) -> Any:
+        """Upload a drive item's raw `/content` bytes — not JSON. Graph's
+        simple-upload endpoint (this one) accepts the file body directly and
+        is only valid for files up to 4MB; larger files need an upload
+        session, not implemented here.
+        """
+        return await self._request("PUT", path, raw_body=data, content_type=content_type)
+
     async def _request(
-        self, method: str, path: str, params: dict | None = None, json_body: Any = None
+        self,
+        method: str,
+        path: str,
+        params: dict | None = None,
+        json_body: Any = None,
+        raw_body: bytes | None = None,
+        content_type: str | None = None,
+        raw: bool = False,
     ) -> Any:
         client = _get_http_client()
         # An absolute URL (e.g. an @odata.nextLink page cursor) is used as-is;
         # a relative path is resolved against the base URL.
         url = path if path.startswith("http") else f"{self._base_url}{path}"
         headers = self._headers()
+        if content_type is not None:
+            headers["Content-Type"] = content_type
         params = self._clean_params(params)
 
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 resp = await client.request(
-                    method, url, headers=headers, params=params, json=json_body
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=json_body if raw_body is None else None,
+                    content=raw_body,
                 )
             except httpx.RequestError as e:
                 last_exc = e
@@ -125,7 +154,7 @@ class GraphClient:
                 continue
 
             self._raise_for_status(resp)
-            return self._parse_body(resp)
+            return resp.content if raw else self._parse_body(resp)
 
         # Unreachable in practice (loop always returns or raises above), but
         # keeps type checkers happy and guards against future edits.
