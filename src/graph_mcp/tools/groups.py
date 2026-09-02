@@ -18,10 +18,10 @@ _DIRECTORY_OBJECT_URL = "https://graph.microsoft.com/v1.0/directoryObjects/{user
 _DEFAULT_MAX_RESULTS = 50
 _HARD_CAP_MAX_RESULTS = 200
 _GRAPH_TOP_MAX = 999
-# Safety cap on how many /groups/delta pages graph_list_owned_groups will
+# Safety cap on how many /groups list pages graph_list_owned_groups will
 # walk (at $top=999/page this covers ~50k groups) — a runaway pagination
 # loop should stop rather than hang the request indefinitely.
-_MAX_DELTA_PAGES = 50
+_MAX_GROUP_LIST_PAGES = 50
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -187,14 +187,18 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         # Graph has no query that reverse-looks-up "groups owned by user X"
         # under Application permissions: /users/{id}/ownedObjects is
-        # documented as unsupported for app-only, and /groups?$filter=
-        # owners/any(...) is rejected outright by Graph itself — "owners"
-        # isn't a filterable property on Group (confirmed against Graph's
-        # advanced-queries docs). The only app-only-safe approach is a full
-        # delta scan of /groups selecting the owners relationship: it
-        # returns each group's owner ids inline, in one paginated pass, so
-        # there's no per-group follow-up call — then keep only the groups
-        # whose owners include this user.
+        # documented as unsupported for app-only, /groups?$filter=
+        # owners/any(...) is rejected outright by Graph ("owners" isn't a
+        # filterable property on Group), and /groups/delta with owners in
+        # $select — which looked like the answer on paper — turned out to
+        # have a real pagination bug when tested against a live tenant: it
+        # re-returns the same ~200 groups on every page instead of
+        # advancing, confirmed independently of whether owners is selected.
+        # Plain /groups listing doesn't have that bug (verified: matches
+        # /groups/$count exactly, one page, no repeats), so the only
+        # approach that's actually verified reliable is enumerate all
+        # groups, then check each one's /owners — N+1, but there's no
+        # working alternative.
         try:
             user = await client.get(f"/users/{user_id}", params={"$select": "id"})
         except GraphError as e:
@@ -205,30 +209,41 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 "not_found", f"User '{user_id}' could not be resolved to an id.", False
             )
 
-        owned_groups: list = []
+        all_groups: list = []
         try:
             result = await client.get(
-                "/groups/delta",
+                "/groups",
                 params={
-                    "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled,owners",
+                    "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
                     "$top": str(_GRAPH_TOP_MAX),
                 },
             )
             pages = 0
             while result:
-                for group in result.get("value", []):
-                    owners = group.pop("owners@delta", None) or []
-                    owner_ids = {o["id"] for o in owners if isinstance(o, dict) and "id" in o}
-                    if resolved_id in owner_ids:
-                        group["owner_count"] = len(owner_ids)
-                        owned_groups.append(group)
+                all_groups.extend(result.get("value", []))
                 pages += 1
                 next_link = result.get("@odata.nextLink")
-                if not next_link or pages >= _MAX_DELTA_PAGES:
+                if not next_link or pages >= _MAX_GROUP_LIST_PAGES:
                     break
                 result = await client.get(next_link)
         except GraphError as e:
             return e.to_envelope()
+
+        owned_groups: list = []
+        for group in all_groups:
+            try:
+                owners = await client.get(
+                    f"/groups/{group['id']}/owners", params={"$select": "id"}
+                )
+            except GraphError:
+                # A transient error checking one group's owners shouldn't
+                # fail the whole scan — we just can't confirm this one, so
+                # it's left out rather than risk a false positive/negative.
+                continue
+            owner_ids = {o["id"] for o in owners.get("value", []) if isinstance(o, dict)}
+            if resolved_id in owner_ids:
+                group["owner_count"] = len(owner_ids)
+                owned_groups.append(group)
 
         return dump_json_capped(
             {"user_id": user_id, "count": len(owned_groups), "groups": owned_groups}

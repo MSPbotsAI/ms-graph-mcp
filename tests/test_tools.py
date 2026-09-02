@@ -173,8 +173,8 @@ async def test_group_search_escapes_apostrophe():
 class _QueuedClient:
     """GraphClient stand-in returning pre-set results in call order — used
     where a tool makes more than one distinct request (e.g. a user-id
-    lookup followed by a paginated /groups/delta scan), so a single fixed
-    result like _CapturingClient's isn't enough."""
+    lookup, a paginated /groups scan, then a per-group /owners check), so
+    a single fixed result like _CapturingClient's isn't enough."""
 
     def __init__(self, results: list):
         self._results = list(results)
@@ -186,13 +186,16 @@ class _QueuedClient:
 
 
 @pytest.mark.asyncio
-async def test_list_owned_groups_paginates_delta_and_filters_by_owner():
-    """graph_list_owned_groups has no app-only-safe way to ask Graph
-    "groups owned by user X" directly (see groups.py's comment), so it
-    walks a full /groups/delta scan and filters client-side. This checks
-    that filtering, the owner_count it derives from owners@delta, and
-    that it follows @odata.nextLink across pages until the delta scan
-    ends (no nextLink on the last page)."""
+async def test_list_owned_groups_enumerates_groups_and_checks_owners():
+    """graph_list_owned_groups has no app-only-safe, correctly-paginating
+    query for "groups owned by user X" (see groups.py's comment — Graph's
+    /groups/delta was tried and found to have a real pagination bug against
+    a live tenant: it re-returns the same page instead of advancing). So it
+    falls back to enumerating all of /groups (paginating via
+    @odata.nextLink) and checking each group's /owners. This verifies that
+    enumeration follows nextLink across pages, checks every group's
+    owners, and correctly keeps only the ones owned by the target user
+    with the right owner_count."""
     from mcp.server.fastmcp import FastMCP
 
     from graph_mcp.tools import groups
@@ -203,25 +206,15 @@ async def test_list_owned_groups_paginates_delta_and_filters_by_owner():
             {"id": "user-123"},  # /users/{id} resolution
             {
                 "value": [
-                    {"id": "g1", "displayName": "Owned Solo", "owners@delta": [{"id": "user-123"}]},
-                    {
-                        "id": "g2",
-                        "displayName": "Not Owned",
-                        "owners@delta": [{"id": "someone-else"}],
-                    },
+                    {"id": "g1", "displayName": "Owned Solo"},
+                    {"id": "g2", "displayName": "Not Owned"},
                 ],
-                "@odata.nextLink": "https://graph.microsoft.com/v1.0/groups/delta?$skiptoken=page2",
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/groups?$skiptoken=page2",
             },
-            {
-                "value": [
-                    {
-                        "id": "g3",
-                        "displayName": "Owned Shared",
-                        "owners@delta": [{"id": "user-123"}, {"id": "other"}],
-                    },
-                ],
-                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/groups/delta?$deltatoken=done",
-            },
+            {"value": [{"id": "g3", "displayName": "Owned Shared"}]},  # page 2, no nextLink
+            {"value": [{"id": "user-123"}]},  # /groups/g1/owners
+            {"value": [{"id": "someone-else"}]},  # /groups/g2/owners
+            {"value": [{"id": "user-123"}, {"id": "other"}]},  # /groups/g3/owners
         ]
     )
     groups.register(mcp, lambda: client)
@@ -236,10 +229,13 @@ async def test_list_owned_groups_paginates_delta_and_filters_by_owner():
     # not present in output — "Not Owned" (g2) was correctly excluded
     assert "g2" not in {g["id"] for g in payload["groups"]}
 
-    # 3 calls total: resolve user_id, then 2 delta pages (stops once a
-    # page has no @odata.nextLink, i.e. only @odata.deltaLink remains).
+    # 6 calls: resolve user_id, 2 pages of /groups, then one /owners
+    # check per group found (3 groups total across both pages).
     assert [c[0] for c in client.calls] == [
         "/users/carl@contoso.com",
-        "/groups/delta",
-        "https://graph.microsoft.com/v1.0/groups/delta?$skiptoken=page2",
+        "/groups",
+        "https://graph.microsoft.com/v1.0/groups?$skiptoken=page2",
+        "/groups/g1/owners",
+        "/groups/g2/owners",
+        "/groups/g3/owners",
     ]
