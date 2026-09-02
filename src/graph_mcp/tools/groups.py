@@ -18,10 +18,10 @@ _DIRECTORY_OBJECT_URL = "https://graph.microsoft.com/v1.0/directoryObjects/{user
 _DEFAULT_MAX_RESULTS = 50
 _HARD_CAP_MAX_RESULTS = 200
 _GRAPH_TOP_MAX = 999
-# How many of a user's owned groups get an owners-count enrichment call —
-# a departing user realistically owns a handful of groups, not hundreds;
-# this bounds the N+1 fan-out the same way sites.py bounds site enrichment.
-_MAX_OWNED_GROUP_ENRICH = 20
+# Safety cap on how many /groups/delta pages graph_list_owned_groups will
+# walk (at $top=999/page this covers ~50k groups) — a runaway pagination
+# loop should stop rather than hang the request indefinitely.
+_MAX_DELTA_PAGES = 50
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -185,15 +185,16 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         if client is None:
             return NO_TOKEN
 
-        # Graph's /users/{id}/ownedObjects has no Application-permission
-        # support at all (confirmed against Microsoft's own docs — the
-        # least/higher-privileged columns both read "Not supported" for
-        # app-only auth), so this can never work under this server's
-        # client-credentials model. Instead: resolve user_id (GUID or UPN)
-        # to its real object id, then find owned groups the other
-        # direction — /groups filtered by owners/any(), which does support
-        # Application permissions via the same Group.Read.All already used
-        # elsewhere in this file.
+        # Graph has no query that reverse-looks-up "groups owned by user X"
+        # under Application permissions: /users/{id}/ownedObjects is
+        # documented as unsupported for app-only, and /groups?$filter=
+        # owners/any(...) is rejected outright by Graph itself — "owners"
+        # isn't a filterable property on Group (confirmed against Graph's
+        # advanced-queries docs). The only app-only-safe approach is a full
+        # delta scan of /groups selecting the owners relationship: it
+        # returns each group's owner ids inline, in one paginated pass, so
+        # there's no per-group follow-up call — then keep only the groups
+        # whose owners include this user.
         try:
             user = await client.get(f"/users/{user_id}", params={"$select": "id"})
         except GraphError as e:
@@ -204,34 +205,34 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 "not_found", f"User '{user_id}' could not be resolved to an id.", False
             )
 
+        owned_groups: list = []
         try:
             result = await client.get(
-                "/groups",
+                "/groups/delta",
                 params={
-                    "$filter": f"owners/any(o:o/id eq '{odata_quote(resolved_id)}')",
-                    "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
-                    "$count": "true",
+                    "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled,owners",
+                    "$top": str(_GRAPH_TOP_MAX),
                 },
-                extra_headers={"ConsistencyLevel": "eventual"},
             )
+            pages = 0
+            while result:
+                for group in result.get("value", []):
+                    owners = group.pop("owners@delta", None) or []
+                    owner_ids = {o["id"] for o in owners if isinstance(o, dict) and "id" in o}
+                    if resolved_id in owner_ids:
+                        group["owner_count"] = len(owner_ids)
+                        owned_groups.append(group)
+                pages += 1
+                next_link = result.get("@odata.nextLink")
+                if not next_link or pages >= _MAX_DELTA_PAGES:
+                    break
+                result = await client.get(next_link)
         except GraphError as e:
             return e.to_envelope()
 
-        groups = result.get("value", []) if isinstance(result, dict) else []
-        for group in groups[:_MAX_OWNED_GROUP_ENRICH]:
-            try:
-                owners = await client.get(
-                    f"/groups/{group['id']}/owners", params={"$select": "id"}
-                )
-                group["owner_count"] = (
-                    len(owners.get("value", [])) if isinstance(owners, dict) else None
-                )
-            except GraphError:
-                # Enrichment failing (e.g. a transient error on one group)
-                # shouldn't fail the whole list — leave owner_count unset.
-                group["owner_count"] = None
-
-        return dump_json_capped({"user_id": user_id, "count": len(groups), "groups": groups})
+        return dump_json_capped(
+            {"user_id": user_id, "count": len(owned_groups), "groups": owned_groups}
+        )
 
     @mcp.tool(
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)

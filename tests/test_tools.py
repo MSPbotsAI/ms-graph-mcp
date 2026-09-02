@@ -5,6 +5,8 @@ list_tools(), and the error-code mapping is tested directly against
 GraphError, independent of any real HTTP request.
 """
 
+import json
+
 import pytest
 
 from graph_mcp.api_client import GraphError
@@ -111,8 +113,6 @@ async def test_service_instructions_present_and_bounded():
     ],
 )
 def test_error_envelope_mapping(status_code, expected_code, expected_retryable):
-    import json
-
     err = GraphError(status_code, "boom")
     envelope = json.loads(err.to_envelope())
     assert envelope["error"]["code"] == expected_code
@@ -168,3 +168,78 @@ async def test_group_search_escapes_apostrophe():
     client.calls.clear()
     await mcp.call_tool("graph_list_groups", {"display_name": "Bob's Team"})
     assert client.calls[0][1]["$filter"] == "startswith(displayName,'Bob''s Team')"
+
+
+class _QueuedClient:
+    """GraphClient stand-in returning pre-set results in call order — used
+    where a tool makes more than one distinct request (e.g. a user-id
+    lookup followed by a paginated /groups/delta scan), so a single fixed
+    result like _CapturingClient's isn't enough."""
+
+    def __init__(self, results: list):
+        self._results = list(results)
+        self.calls: list[tuple[str, dict]] = []
+
+    async def get(self, path: str, params: dict | None = None) -> dict:
+        self.calls.append((path, params or {}))
+        return self._results.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_list_owned_groups_paginates_delta_and_filters_by_owner():
+    """graph_list_owned_groups has no app-only-safe way to ask Graph
+    "groups owned by user X" directly (see groups.py's comment), so it
+    walks a full /groups/delta scan and filters client-side. This checks
+    that filtering, the owner_count it derives from owners@delta, and
+    that it follows @odata.nextLink across pages until the delta scan
+    ends (no nextLink on the last page)."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import groups
+
+    mcp = FastMCP(name="test")
+    client = _QueuedClient(
+        [
+            {"id": "user-123"},  # /users/{id} resolution
+            {
+                "value": [
+                    {"id": "g1", "displayName": "Owned Solo", "owners@delta": [{"id": "user-123"}]},
+                    {
+                        "id": "g2",
+                        "displayName": "Not Owned",
+                        "owners@delta": [{"id": "someone-else"}],
+                    },
+                ],
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/groups/delta?$skiptoken=page2",
+            },
+            {
+                "value": [
+                    {
+                        "id": "g3",
+                        "displayName": "Owned Shared",
+                        "owners@delta": [{"id": "user-123"}, {"id": "other"}],
+                    },
+                ],
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/groups/delta?$deltatoken=done",
+            },
+        ]
+    )
+    groups.register(mcp, lambda: client)
+
+    _, structured = await mcp.call_tool("graph_list_owned_groups", {"user_id": "carl@contoso.com"})
+    payload = json.loads(structured["result"])
+
+    assert payload["count"] == 2
+    assert {g["id"] for g in payload["groups"]} == {"g1", "g3"}
+    owner_counts = {g["id"]: g["owner_count"] for g in payload["groups"]}
+    assert owner_counts == {"g1": 1, "g3": 2}
+    # not present in output — "Not Owned" (g2) was correctly excluded
+    assert "g2" not in {g["id"] for g in payload["groups"]}
+
+    # 3 calls total: resolve user_id, then 2 delta pages (stops once a
+    # page has no @odata.nextLink, i.e. only @odata.deltaLink remains).
+    assert [c[0] for c in client.calls] == [
+        "/users/carl@contoso.com",
+        "/groups/delta",
+        "https://graph.microsoft.com/v1.0/groups/delta?$skiptoken=page2",
+    ]
