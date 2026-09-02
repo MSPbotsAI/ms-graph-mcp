@@ -81,8 +81,10 @@ class GraphClient:
             return {}
         return {k: v for k, v in params.items() if v is not None}
 
-    async def get(self, path: str, params: dict | None = None) -> Any:
-        return await self._request("GET", path, params=params)
+    async def get(
+        self, path: str, params: dict | None = None, extra_headers: dict[str, str] | None = None
+    ) -> Any:
+        return await self._request("GET", path, params=params, extra_headers=extra_headers)
 
     async def post(self, path: str, body: Any = None) -> Any:
         return await self._request("POST", path, json_body=body)
@@ -120,6 +122,7 @@ class GraphClient:
         raw_body: bytes | None = None,
         content_type: str | None = None,
         raw: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ) -> Any:
         client = _get_http_client()
         # An absolute URL (e.g. an @odata.nextLink page cursor) is used as-is;
@@ -128,6 +131,8 @@ class GraphClient:
         headers = self._headers()
         if content_type is not None:
             headers["Content-Type"] = content_type
+        if extra_headers:
+            headers.update(extra_headers)
         params = self._clean_params(params)
 
         last_exc: Exception | None = None

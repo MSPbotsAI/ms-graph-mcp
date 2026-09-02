@@ -5,7 +5,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .._json import dump_json_capped
+from .._json import dump_json_capped, error_envelope
 from ..api_client import GraphClient, GraphError
 from ._common import NO_TOKEN, odata_quote
 
@@ -185,10 +185,34 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         if client is None:
             return NO_TOKEN
 
+        # Graph's /users/{id}/ownedObjects has no Application-permission
+        # support at all (confirmed against Microsoft's own docs — the
+        # least/higher-privileged columns both read "Not supported" for
+        # app-only auth), so this can never work under this server's
+        # client-credentials model. Instead: resolve user_id (GUID or UPN)
+        # to its real object id, then find owned groups the other
+        # direction — /groups filtered by owners/any(), which does support
+        # Application permissions via the same Group.Read.All already used
+        # elsewhere in this file.
+        try:
+            user = await client.get(f"/users/{user_id}", params={"$select": "id"})
+        except GraphError as e:
+            return e.to_envelope()
+        resolved_id = user.get("id") if isinstance(user, dict) else None
+        if not resolved_id:
+            return error_envelope(
+                "not_found", f"User '{user_id}' could not be resolved to an id.", False
+            )
+
         try:
             result = await client.get(
-                f"/users/{user_id}/ownedObjects/microsoft.graph.group",
-                params={"$select": "id,displayName,groupTypes,securityEnabled,mailEnabled"},
+                "/groups",
+                params={
+                    "$filter": f"owners/any(o:o/id eq '{odata_quote(resolved_id)}')",
+                    "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
+                    "$count": "true",
+                },
+                extra_headers={"ConsistencyLevel": "eventual"},
             )
         except GraphError as e:
             return e.to_envelope()
