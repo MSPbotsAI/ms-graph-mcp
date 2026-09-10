@@ -86,8 +86,10 @@ class GraphClient:
     ) -> Any:
         return await self._request("GET", path, params=params, extra_headers=extra_headers)
 
-    async def post(self, path: str, body: Any = None) -> Any:
-        return await self._request("POST", path, json_body=body)
+    async def post(
+        self, path: str, body: Any = None, extra_headers: dict[str, str] | None = None
+    ) -> Any:
+        return await self._request("POST", path, json_body=body, extra_headers=extra_headers)
 
     async def patch(self, path: str, body: Any = None) -> Any:
         return await self._request("PATCH", path, json_body=body)

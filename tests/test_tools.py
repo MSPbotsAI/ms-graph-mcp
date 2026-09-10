@@ -45,6 +45,10 @@ EXPECTED_TOOLS = {
     "graph_delete_file": {"drive_id", "item_id"},
     "graph_list_managed_devices": {"user_id"},
     "graph_remove_managed_device": {"device_id"},
+    "graph_list_calendar_events": {"start_datetime", "end_datetime"},
+    "graph_get_user_availability": {"user_ids", "start_datetime", "end_datetime"},
+    "graph_create_calendar_event": {"subject", "start_datetime", "end_datetime"},
+    "graph_cancel_calendar_event": {"event_id"},
 }
 
 # Tools that are not plain read-only queries (writes / mutations).
@@ -62,6 +66,8 @@ _NON_READ_ONLY = {
     "graph_create_file_text",
     "graph_delete_file",
     "graph_remove_managed_device",
+    "graph_create_calendar_event",
+    "graph_cancel_calendar_event",
 }
 
 
@@ -71,10 +77,14 @@ async def test_tools_list_snapshot():
     tools = await mcp.list_tools()
     names = {t.name for t in tools}
     assert names == set(EXPECTED_TOOLS), f"unexpected tool set: {names}"
-    # 25: original <=20 guideline, +2 for SharePoint create/delete (PRD-17756),
+    # 29: original <=20 guideline, +2 for SharePoint create/delete (PRD-17756),
     # +3 for graph_list_owned_groups/graph_list_managed_devices/
-    # graph_remove_managed_device (PRD-17403 offboarding tool-gap audit).
-    assert len(names) <= 25, "tool count should stay within the SOP's <=20 guideline (+5 justified)"
+    # graph_remove_managed_device (PRD-17403 offboarding tool-gap audit),
+    # +4 for the calendar domain (PRD-18631): listing events, free/busy across
+    # mailboxes, creating and cancelling an event are four distinct Graph
+    # endpoints with disjoint arguments — merging any pair would mean one tool
+    # whose required params depend on a mode flag, which reads worse to an agent.
+    assert len(names) <= 29, "tool count should stay within the SOP's <=20 guideline (+9 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -125,10 +135,34 @@ class _CapturingClient:
 
     def __init__(self, result: dict | None = None):
         self.calls: list[tuple[str, dict]] = []
+        self.headers: list[dict] = []
+        self.bodies: list[dict] = []
+        self.methods: list[str] = []
         self._result = result if result is not None else {"value": []}
 
-    async def get(self, path: str, params: dict | None = None) -> dict:
+    async def get(
+        self,
+        path: str,
+        params: dict | None = None,
+        extra_headers: dict | None = None,
+    ) -> dict:
+        self.methods.append("GET")
         self.calls.append((path, params or {}))
+        self.headers.append(extra_headers or {})
+        return self._result
+
+    async def post(
+        self, path: str, body: dict | None = None, extra_headers: dict | None = None
+    ) -> dict:
+        self.methods.append("POST")
+        self.calls.append((path, {}))
+        self.bodies.append(body or {})
+        self.headers.append(extra_headers or {})
+        return self._result
+
+    async def delete(self, path: str) -> dict:
+        self.methods.append("DELETE")
+        self.calls.append((path, {}))
         return self._result
 
 
@@ -239,3 +273,193 @@ async def test_list_owned_groups_enumerates_groups_and_checks_owners():
         "/groups/g2/owners",
         "/groups/g3/owners",
     ]
+
+
+class _FailingPostClient:
+    """Stand-in whose POST fails with a given status, so the cancel tool's
+    fallback path can be exercised. DELETE succeeds."""
+
+    def __init__(self, post_status: int):
+        self._post_status = post_status
+        self.calls: list[tuple[str, str]] = []
+
+    async def post(self, path: str, body: dict | None = None, extra_headers: dict | None = None):
+        self.calls.append(("POST", path))
+        raise GraphError(self._post_status, "boom")
+
+    async def delete(self, path: str):
+        self.calls.append(("DELETE", path))
+        return None
+
+
+def _calendar_mcp(client) -> object:
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import calendar
+
+    mcp = FastMCP(name="test")
+    calendar.register(mcp, lambda: client)
+    return mcp
+
+
+@pytest.mark.asyncio
+async def test_list_calendar_events_targets_user_and_sets_timezone_preference():
+    """user_id must switch the path off /me (an app-only token has no /me), and
+    the requested time zone has to ride along as a Prefer header, otherwise Graph
+    answers in UTC no matter what the agent asked for."""
+    client = _CapturingClient()
+    mcp = _calendar_mcp(client)
+
+    await mcp.call_tool(
+        "graph_list_calendar_events",
+        {
+            "start_datetime": "2026-09-15T09:00:00",
+            "end_datetime": "2026-09-15T18:00:00",
+            "user_id": "alice@contoso.com",
+            "timezone": "China Standard Time",
+        },
+    )
+    path, params = client.calls[0]
+    assert path == "/users/alice@contoso.com/calendarView"
+    assert params["startDateTime"] == "2026-09-15T09:00:00"
+    assert params["endDateTime"] == "2026-09-15T18:00:00"
+    assert params["$top"] == 25
+    assert params["$orderby"] == "start/dateTime"
+    assert client.headers[0] == {"Prefer": 'outlook.timezone="China Standard Time"'}
+
+    client.calls.clear()
+    await mcp.call_tool(
+        "graph_list_calendar_events",
+        {"start_datetime": "2026-09-15T09:00:00", "end_datetime": "2026-09-15T18:00:00"},
+    )
+    assert client.calls[0][0] == "/me/calendarView"
+
+
+@pytest.mark.asyncio
+async def test_list_calendar_events_caps_limit_in_schema():
+    mcp = create_mcp_server(Settings())
+    tool = {t.name: t for t in await mcp.list_tools()}["graph_list_calendar_events"]
+    assert tool.inputSchema["properties"]["limit"]["maximum"] == 200
+
+
+@pytest.mark.asyncio
+async def test_get_user_availability_splits_datetime_and_timezone():
+    """getSchedule takes dateTimeTimeZone objects, not ISO strings — a flat
+    string here is a 400 from Graph."""
+    client = _CapturingClient()
+    mcp = _calendar_mcp(client)
+
+    await mcp.call_tool(
+        "graph_get_user_availability",
+        {
+            "user_ids": ["alice@contoso.com", "bob@contoso.com"],
+            "start_datetime": "2026-09-15T09:00:00",
+            "end_datetime": "2026-09-15T18:00:00",
+            "interval_minutes": 60,
+            "caller_user_id": "alice@contoso.com",
+        },
+    )
+    assert client.calls[0][0] == "/users/alice@contoso.com/calendar/getSchedule"
+    assert client.bodies[0] == {
+        "schedules": ["alice@contoso.com", "bob@contoso.com"],
+        "startTime": {"dateTime": "2026-09-15T09:00:00", "timeZone": "UTC"},
+        "endTime": {"dateTime": "2026-09-15T18:00:00", "timeZone": "UTC"},
+        "availabilityViewInterval": 60,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_user_availability_rejects_too_many_mailboxes():
+    client = _CapturingClient()
+    mcp = _calendar_mcp(client)
+
+    _, structured = await mcp.call_tool(
+        "graph_get_user_availability",
+        {
+            "user_ids": [f"u{i}@contoso.com" for i in range(21)],
+            "start_datetime": "2026-09-15T09:00:00",
+            "end_datetime": "2026-09-15T18:00:00",
+        },
+    )
+    payload = json.loads(structured["result"])
+    assert payload["error"]["code"] == "invalid_argument"
+    assert client.calls == []  # rejected before any request went out
+
+
+@pytest.mark.asyncio
+async def test_create_calendar_event_builds_attendees_and_teams_meeting():
+    client = _CapturingClient(result={"id": "evt-1", "webLink": "https://x", "onlineMeeting": {"joinUrl": "https://teams/x"}})
+    mcp = _calendar_mcp(client)
+
+    _, structured = await mcp.call_tool(
+        "graph_create_calendar_event",
+        {
+            "subject": "Quarterly review",
+            "start_datetime": "2026-09-15T14:00:00",
+            "end_datetime": "2026-09-15T15:00:00",
+            "attendees": ["alice@contoso.com"],
+            "optional_attendees": ["bob@contoso.com"],
+            "user_id": "carl@contoso.com",
+            "is_online_meeting": True,
+            "location": "Room 3",
+        },
+    )
+    assert client.calls[0][0] == "/users/carl@contoso.com/events"
+    body = client.bodies[0]
+    assert body["attendees"] == [
+        {"emailAddress": {"address": "alice@contoso.com"}, "type": "required"},
+        {"emailAddress": {"address": "bob@contoso.com"}, "type": "optional"},
+    ]
+    assert body["start"] == {"dateTime": "2026-09-15T14:00:00", "timeZone": "UTC"}
+    assert body["isOnlineMeeting"] is True
+    assert body["onlineMeetingProvider"] == "teamsForBusiness"
+    assert body["location"] == {"displayName": "Room 3"}
+    # An event with no body/reminder must not send empty keys Graph would reject.
+    assert "body" not in body and "reminderMinutesBeforeStart" not in body
+
+    payload = json.loads(structured["result"])
+    assert payload["event_id"] == "evt-1"
+    assert payload["join_url"] == "https://teams/x"
+    assert payload["attendees_invited"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_status", [400, 403])
+async def test_cancel_calendar_event_falls_back_to_delete(post_status):
+    """/cancel is organizer-only and rejects appointments with no attendees;
+    the user still meant "get this off the calendar", so a rejected cancel
+    must fall through to a delete rather than surfacing the 400."""
+    client = _FailingPostClient(post_status)
+    mcp = _calendar_mcp(client)
+
+    _, structured = await mcp.call_tool(
+        "graph_cancel_calendar_event", {"event_id": "evt-1", "user_id": "carl@contoso.com"}
+    )
+    payload = json.loads(structured["result"])
+    assert payload == {"event_id": "evt-1", "cancelled": True, "method": "deleted"}
+    assert client.calls == [
+        ("POST", "/users/carl@contoso.com/events/evt-1/cancel"),
+        ("DELETE", "/users/carl@contoso.com/events/evt-1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_calendar_event_is_idempotent_on_missing_event():
+    client = _FailingPostClient(404)
+    mcp = _calendar_mcp(client)
+
+    _, structured = await mcp.call_tool("graph_cancel_calendar_event", {"event_id": "gone"})
+    payload = json.loads(structured["result"])
+    assert payload["cancelled"] is True and payload["method"] == "already_absent"
+    assert client.calls == [("POST", "/me/events/gone/cancel")]  # no pointless delete
+
+
+@pytest.mark.asyncio
+async def test_cancel_calendar_event_surfaces_other_errors():
+    client = _FailingPostClient(429)
+    mcp = _calendar_mcp(client)
+
+    _, structured = await mcp.call_tool("graph_cancel_calendar_event", {"event_id": "evt-1"})
+    payload = json.loads(structured["result"])
+    assert payload["error"]["code"] == "rate_limited"
+    assert len(client.calls) == 1  # did not fall through to a delete

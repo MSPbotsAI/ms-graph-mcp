@@ -1,10 +1,10 @@
 # graph-mcp
 
-Microsoft Graph MCP server — exposes Azure Entra ID user, group, and license management, mail sending, and SharePoint document read/write as MCP tools over HTTP-SSE, covering the full user onboarding/offboarding lifecycle plus basic SharePoint document access.
+Microsoft Graph MCP server — exposes Azure Entra ID user, group, and license management, mail sending, SharePoint document read/write, and calendar scheduling as MCP tools over HTTP-SSE, covering the full user onboarding/offboarding lifecycle plus basic SharePoint document access and meeting booking.
 
 ## Overview
 
-This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) (HTTP-SSE transport) and wraps the Microsoft Graph API. It exposes 25 tools spanning user management (create / read / update / disable, password reset, session revocation, manager assignment, MFA method listing), group membership and ownership (add / remove / list / search, owned-groups orphan check), license inventory and assignment, sending mail, SharePoint sites/document libraries (find a site, browse a document library, create/read/write/delete small text files), and Intune-managed devices (list / remove a user's enrolled devices). It is designed for **gateway mode**: the caller obtains an Azure access token via OAuth and passes it per-request through a header. The server itself holds no credentials.
+This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) (HTTP-SSE transport) and wraps the Microsoft Graph API. It exposes 29 tools spanning user management (create / read / update / disable, password reset, session revocation, manager assignment, MFA method listing), group membership and ownership (add / remove / list / search, owned-groups orphan check), license inventory and assignment, sending mail, SharePoint sites/document libraries (find a site, browse a document library, create/read/write/delete small text files), Intune-managed devices (list / remove a user's enrolled devices), and calendar (list events in a time window, check free/busy across mailboxes, create and cancel events). It is designed for **gateway mode**: the caller obtains an Azure access token via OAuth and passes it per-request through a header. The server itself holds no credentials.
 
 ## Quick Start
 
@@ -91,10 +91,14 @@ Connect your MCP client with:
 | `graph_delete_file` | 永久删除一个文件（进站点回收站，跟SharePoint网页里删除等效）；幂等，删一个已经不存在的item id也返回成功 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_list_managed_devices` | 列出用户的 Intune 托管设备；租户没开 Intune license 时不报错，返回空列表 | `DeviceManagementManagedDevices.Read.All` |
 | `graph_remove_managed_device` | 永久删除一个设备的 Intune 管理记录（不是选择性的公司数据擦除/retire，是直接删记录）；幂等，删已经不存在的device id也返回成功 | `DeviceManagementManagedDevices.ReadWrite.All` |
+| `graph_list_calendar_events` | 查询某个用户某段时间窗口内的日历事件（`calendarView`，重复性会议会展开成一个个实例）；结果只取第一页，窗口太大就自己缩窗口，别加大 limit | `Calendars.Read`（读别人的日历：app-only 权限，或委派下该日历已共享给调用者，见 `Calendars.Read.Shared`） |
+| `graph_get_user_availability` | 一次查最多 20 个邮箱的 free/busy（`getSchedule`），返回每人一串 availabilityView（0空闲 1暂定 2忙 3外出 4在别处办公）+ 工作时间；排会先用它找空档，比逐个读日历更省也更少侵犯隐私 | `Calendars.Read` |
+| `graph_create_calendar_event` | 建日历事件，可带必选/可选与会者、地点、正文、提醒，`is_online_meeting=true` 会挂一个 Teams 会议并把 joinUrl 返回；**调用即刻发出邀请**，不可撤回，只能事后取消 | `Calendars.ReadWrite`（在别人日历上建：app-only 权限，或委派下 `Calendars.ReadWrite.Shared`） |
+| `graph_cancel_calendar_event` | 取消/删除一个事件：调用者是组织者且有与会者时走 `cancel`（给所有与会者发取消通知），否则退回直接 `delete`，返回值里的 `method` 说明实际走了哪条；幂等，取消一个已经不存在的 event id 也返回成功 | `Calendars.ReadWrite` |
 
 > **权限说明**：本文件里所有 SharePoint 工具全部只调用 Graph 的 `/sites/*` 和 `/drives/*` 端点，从不触碰 `/me/drive` 或 `/users/{id}/drive`。这类站点文档库驱动器接口，`Sites.*` 和 `Files.*` 是二选一的替代权限组，不是叠加要求——所以只需要 `Sites.Read.All`（只读工具）+ `Sites.ReadWrite.All`（写/建/删工具），完全不需要额外申请 `Files.ReadWrite.All`。
 
-> **实际申请的 scope**：上表逐个工具列的是各端点**最小**受理权限，便于按需裁剪；平台侧（MCP-Management-Service 的 `auth/oauth/vendors/msgraph.py`）实际向 Entra 申请的是能覆盖全部 25 个工具的并集：
+> **实际申请的 scope**：上表逐个工具列的是各端点**最小**受理权限，便于按需裁剪；平台侧（MCP-Management-Service 的 `auth/oauth/vendors/msgraph.py`）实际向 Entra 申请的是能覆盖全部 29 个工具的并集：
 >
 > ```
 > offline_access openid profile
@@ -103,11 +107,14 @@ Connect your MCP client with:
 > Organization.Read.All Mail.Send Mail.Send.Shared
 > Sites.ReadWrite.All Files.Read.All Files.ReadWrite.All
 > DeviceManagementManagedDevices.ReadWrite.All
+> Calendars.ReadWrite Calendars.ReadWrite.Shared
 > ```
 >
 > 其中 `User.ReadWrite.All` 覆盖建/改用户、改密、分配许可、注销会话（这些端点各自的最小权限分散在 `User-PasswordProfile.ReadWrite.All`、`User.EnableDisableAccount.All`、`LicenseAssignment.ReadWrite.All`、`User.RevokeSessions.All`，用一条覆盖比申请五条更诚实）；`Sites.ReadWrite.All` 包含 `Sites.Read.All` 故不重复列；`DeviceManagementManagedDevices.ReadWrite.All` 同理包含 `.Read.All`，覆盖 `graph_list_managed_devices` + `graph_remove_managed_device` 两个工具；**不申请** `Directory.Read.All`（没有工具需要通读目录）和 `Group.ReadWrite.All`（没有工具建组/删组/改组属性）。
 >
 > `Files.Read.All` / `Files.ReadWrite.All` 是运维决定一并申请的：如上一条所述，对本文件用到的 `/sites/*`、`/drives/*` 端点，`Files.*` 与 `Sites.*` 是**二选一**的替代权限组，工具本身不需要它——加上是为了让"管理员只同意了其中一组"的租户也能落到可用状态。代价是 `Files.*` 同时覆盖每个用户的 OneDrive，而这里没有任何工具会去碰它。
+
+> `Calendars.ReadWrite` / `Calendars.ReadWrite.Shared` 覆盖全部 4 个日历工具：前者是自己邮箱的日历读写（含 `getSchedule` 的 free/busy），后者才是"操作别人的日历"——委派模式下，只有当目标日历已经共享/委派给登录的管理员时才可能生效，这是 MSP 场景的常态入口。`Calendars.Read` / `Calendars.Read.Shared` 是它们的严格子集，不重复申请。app-only（`ms-graph-app`）没有这一层限制：应用权限 `Calendars.ReadWrite` 直接覆盖租户里**每一个**邮箱的日历，客户放权前要清楚这一点。
 
 ## Typical Workflows
 
@@ -132,6 +139,14 @@ Offboarding：
 7. graph_remove_group_member                → 移出各个组
 ```
 
+Scheduling（排会）：
+```
+1. graph_get_user_availability   → 一次查所有参会人的 free/busy，找出共同空档
+2. graph_create_calendar_event   → 在空档上建会议并发出邀请（可挂 Teams 会议）
+3. graph_list_calendar_events    → 事后核对/拿 event id
+4. graph_cancel_calendar_event   → 会议取消，通知所有与会者
+```
+
 ## Known Gaps
 
 - `graph_remove_group_member`、`graph_revoke_sessions`、`graph_update_user` 的 `account_enabled` 参数、`graph_assign_license` 的 `remove_sku_ids` 参数都是新加的，尚未随真实 Graph 租户测试过——上线前建议先用一个可牺牲的测试账号走一遍完整离职流程再信任。
@@ -141,6 +156,8 @@ Offboarding：
 - **`graph_read_file_text`/`graph_write_file_text`/`graph_create_file_text`/`graph_delete_file` 尚未真实调用验证**——实测时该租户里能找到的现成文件全是pdf/docx/xlsx/JPG，没有可用的纯文本文件；`graph_write_file_text`同时因为是真实客户数据，没有贸然覆盖测试。`graph_create_file_text`/`graph_delete_file` 这两个工具正是为了解决"没有安全的测试文件"这个问题后补的（新建走独立path、不存在才成功；删除幂等），但补上后还没有拿真实token走完一次create→write→read→delete的完整链路。
 - **`graph_list_owned_groups`/`graph_list_managed_devices`/`graph_remove_managed_device` 是新加的**（PRD-17403，2026-09-01）。`DeviceManagementManagedDevices.*` 权限已在INT真实租户确认生效（用一个不存在的user_id测试，报错从"unauthorized: missing scope"变成了真实的Intune后端404，证明权限门槛已通过），但**还没找到一个真实存在的user_id**，所以`graph_list_managed_devices`没有拿到过真正有数据的正面结果，`graph_remove_managed_device`更是完全没测过。
 - **`graph_list_owned_groups` 的实现改过三版**：第一版`/users/{id}/ownedObjects`被官方文档证实不支持app-only；第二版`/groups?$filter=owners/any(...)`在真实客户租户（Precicom sandbox，2qmxyw.onmicrosoft.com）上线后被Graph直接拒绝——`owners`根本不是`/groups`上的可filter属性，这个查询语法本身就不存在，是本仓库的实现bug，不是权限问题；第三版`/groups/delta?$select=...,owners`本以为是文档记录的正解，但用真实token本地直连Graph测试后发现delta本身的分页有bug——不管select不select owners，同一批约200个组会被反复返回、`@odata.nextLink`推进不了，5页拉了1000条却只有200个不同id，而普通`/groups`列表在同一租户一次就能正确拉完全部279条并与`$count`对上。2026-09-02改为第四版（当前版本）：放弃delta，改回全量`/groups`列表分页 + 逐组调`/groups/{id}/owners`核对——**已用真实delegated token对真实租户（mspbots.ai内部租户）端到端验证**：279个组全部检查完毕、无报错，与手工全量核对结果一致（该测试用户实际不拥有任何组，`count:0`是真实结果，不是bug掩盖的假阴性）。代价是N+1请求量随租户group总数线性增长，无法绕开全量扫描（`$expand`/`$search`/delta 均已验证不可行——详见上表)。
+- **日历工具（`graph_list_calendar_events`/`graph_get_user_availability`/`graph_create_calendar_event`/`graph_cancel_calendar_event`）尚未在真实已同意租户上跑通**（PRD-18631，2026-09-10 交付）：平台侧 `msgraph.py` 已把 `Calendars.ReadWrite`/`Calendars.ReadWrite.Shared` 加进委派 scope，但 MSPbots 共享 Entra 应用的 API permissions 还要人工加上、且已授权租户必须重新授权才会拿到新权限；app-only 侧则要客户自己在应用注册里加应用权限 `Calendars.ReadWrite` 并 grant admin consent。在此之前调用这几个工具会返回 `unauthorized`。
+- **日历工具刻意不做改期（PATCH）、与会者回复状态查询、重复性规则编辑、会议室/设备资源预订**：排会闭环用不到，加进来只会稀释 agent 的选工具准确率。要改期目前只能取消后重建。
 
 ## Sovereign Cloud Support
 
@@ -152,3 +169,4 @@ Set `GRAPH_BASE_URL` to override the default endpoint:
 | US Government GCC High | `https://graph.microsoft.us/v1.0` |
 | US Government DoD | `https://dod-graph.microsoft.us/v1.0` |
 | China (21Vianet) | `https://microsoftgraph.chinacloudapi.cn/v1.0` |
+

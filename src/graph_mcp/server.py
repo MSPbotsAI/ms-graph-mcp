@@ -77,7 +77,7 @@ def create_mcp_server(settings: Settings) -> FastMCP:
         name="graph-mcp",
         instructions=(
             "Microsoft Graph is Microsoft's unified API for Entra ID (Azure AD) and "
-            "Microsoft 365 tenant data. This server exposes 6 tool domains modeling "
+            "Microsoft 365 tenant data. This server exposes 7 tool domains modeling "
             "the identity lifecycle in a tenant: users (create/read/update accounts, "
             "reset passwords, list MFA methods, assign managers, revoke sessions), "
             "groups (search/list groups, manage a user's memberships and owned "
@@ -85,18 +85,20 @@ def create_mcp_server(settings: Settings) -> FastMCP:
             "user — usage_location must be set first), mail (send email as the "
             "signed-in user via delegated Mail.Send), sites (read/write SharePoint "
             "document libraries: graph_search_sites -> graph_list_drive_items -> "
-            "graph_read_file_text for small text files, or graph_get_file's "
-            "downloadUrl for anything larger/binary), and devices (list/remove a "
-            "user's Intune-enrolled devices — requires an active Intune license). "
+            "graph_read_file_text for small text files; graph_get_file's downloadUrl "
+            "for larger/binary), devices (list/remove a user's Intune-enrolled "
+            "devices — requires an active Intune license), and calendar (list events "
+            "in a time window, check free/busy, create and cancel events). "
             "Typical onboarding: graph_check_user_exists -> graph_create_user -> "
             "graph_assign_groups -> graph_check_license_stock -> "
             "graph_assign_license -> graph_send_mail. Typical offboarding: "
             "graph_update_user(account_enabled=false) -> graph_revoke_sessions -> "
-            "graph_list_owned_groups (reassign any group this user solely owns) -> "
-            "graph_list_managed_devices -> graph_remove_managed_device -> "
-            "graph_assign_license(remove_sku_ids=...) -> graph_remove_group_member. "
-            "All tools act on the caller's own tenant via a bearer access token "
-            "supplied per-request; there is no cross-tenant access."
+            "graph_list_owned_groups -> graph_list_managed_devices -> "
+            "graph_remove_managed_device -> graph_assign_license(remove_sku_ids=...) "
+            "-> graph_remove_group_member. Typical scheduling: "
+            "graph_get_user_availability -> graph_create_calendar_event. All tools "
+            "act on the caller's own tenant via a per-request bearer token; there is "
+            "no cross-tenant access."
         ),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
         stateless_http=True,
@@ -105,7 +107,7 @@ def create_mcp_server(settings: Settings) -> FastMCP:
 
     client_factory: Callable[[], GraphClient | None] = lambda: get_client_from_context(settings)
 
-    from .tools import devices, groups, licenses, mail, sites, users
+    from .tools import calendar, devices, groups, licenses, mail, sites, users
 
     users.register(mcp, client_factory)
     groups.register(mcp, client_factory)
@@ -113,5 +115,6 @@ def create_mcp_server(settings: Settings) -> FastMCP:
     mail.register(mcp, client_factory)
     sites.register(mcp, client_factory)
     devices.register(mcp, client_factory)
+    calendar.register(mcp, client_factory)
 
     return mcp
