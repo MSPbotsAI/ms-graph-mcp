@@ -138,12 +138,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         """Get a file's metadata (name, size, MIME type) and a
         pre-authenticated temporary download link — NOT the file's content.
 
-        Use for "send me a link to this file", "how big is that document",
-        "what type of file is this" — or as a size/type check before
-        graph_read_file_text. The returned downloadUrl works for ANY file
-        (including .docx/.xlsx/.pdf), fetched outside this MCP. For "what
-        does this document say" (actual text content), use
-        graph_read_file_text instead — it works only for small text files.
+        Use for "send me a link to this file" or as a size/type check
+        before graph_read_file_text. The returned downloadUrl works for
+        ANY file (including .docx/.xlsx/.pdf), fetched outside this MCP.
+        For what a document actually says, use graph_read_file_text —
+        small text files only.
         """
         client = client_factory()
         if client is None:
@@ -164,11 +163,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         """Read a small text file's actual content (.txt/.md/.csv/.json
         and similar) as a UTF-8 string — the real text, not a link.
 
-        Use for "what does onboarding-checklist.md say", "read that SOP
-        text file", "summarize this .md doc". Rejects (clear error, no
-        truncation/garbling) anything over 200,000 bytes or failing UTF-8
-        decoding — i.e. a binary Office document (.docx/.xlsx/.pdf). For
-        those, use graph_get_file's downloadUrl — this tool can't read them.
+        Use for "what does onboarding-checklist.md say" or "summarize
+        this .md doc". Rejects (clear error, no truncation) anything over
+        200,000 bytes or failing UTF-8 decoding — i.e. a binary Office
+        document (.docx/.xlsx/.pdf); for those use graph_get_file's
+        downloadUrl instead.
         """
         client = client_factory()
         if client is None:
@@ -227,11 +226,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         .csv/.json). For a path that doesn't exist yet, use
         graph_create_file_text — this tool refuses to guess.
 
-        Use for "update review-notes.md with these findings", "save my
-        edits to that file". Whole-document write, not a patch/append: the
-        given content REPLACES everything the file had — fetch the current
-        text with graph_read_file_text first unless deliberately replacing
-        it wholesale. Refuses non-text targets (binary Office documents).
+        Whole-document write, not a patch/append: the given content
+        REPLACES everything the file had — fetch the current text with
+        graph_read_file_text first unless deliberately replacing it
+        wholesale. Refuses non-text targets (binary Office documents).
         """
         client = client_factory()
         if client is None:
@@ -353,9 +351,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         same as deleting it in the SharePoint UI — recoverable there for a
         limited time, but gone from this MCP's view immediately).
 
-        Use for "delete that scratch file", "remove the test file I just
-        made" — confirm the exact file with the user before calling on
-        anything that wasn't clearly created for throwaway/test purposes.
+        Confirm the exact file with the user before calling on anything
+        that wasn't clearly created for throwaway/test purposes.
         Idempotent: deleting an already-deleted item id returns success,
         not an error.
         """

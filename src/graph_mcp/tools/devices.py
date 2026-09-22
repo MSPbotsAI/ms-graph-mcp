@@ -64,13 +64,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     ) -> str:
         """Permanently delete a device's Intune management record.
 
-        This removes Intune's record of the device entirely (not a
-        selective corporate-data wipe/retire — this tool doesn't expose
-        that separate action). Use for offboarding once
-        graph_list_managed_devices has confirmed which device(s) belong
-        to the departing user; confirm the exact device_id with the user
-        before calling. Idempotent: deleting an already-removed device id
-        returns success, not an error.
+        Removes Intune's record of the device entirely — not a selective
+        corporate-data wipe/retire, which this tool doesn't expose. Use for
+        offboarding once graph_list_managed_devices has confirmed the
+        device; confirm the exact device_id first. Idempotent: deleting an
+        already-removed device id returns success.
         """
         client = client_factory()
         if client is None:
