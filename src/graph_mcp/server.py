@@ -77,8 +77,9 @@ def create_mcp_server(settings: Settings) -> FastMCP:
         name="graph-mcp",
         instructions=(
             "Microsoft Graph is Microsoft's unified API for Entra ID (Azure AD) and "
-            "Microsoft 365 tenant data. This server exposes 7 tool domains modeling "
-            "the identity lifecycle in a tenant: users (create/read/update accounts, "
+            "Microsoft 365 data. This server exposes 7 tool domains modeling "
+            "the identity lifecycle in a tenant: users (search the directory, "
+            "create/read/update accounts, "
             "reset passwords, list MFA methods, assign managers, revoke sessions), "
             "groups (search/list groups, manage a user's memberships and owned "
             "groups), licenses (check tenant SKU stock and assign/remove SKUs on a "
@@ -97,8 +98,8 @@ def create_mcp_server(settings: Settings) -> FastMCP:
             "graph_remove_managed_device -> graph_assign_license(remove_sku_ids=...) "
             "-> graph_remove_group_member. Typical scheduling: "
             "graph_get_user_availability -> graph_create_calendar_event. All tools "
-            "act on the caller's own tenant via a per-request bearer token; there is "
-            "no cross-tenant access."
+            "act on the caller's own tenant via a per-request bearer token; no "
+            "cross-tenant access."
         ),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
         stateless_http=True,

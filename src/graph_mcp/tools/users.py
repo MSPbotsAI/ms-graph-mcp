@@ -9,6 +9,22 @@ from .._json import dump_json_capped, error_envelope
 from ..api_client import DEFAULT_BASE_URL, GraphClient, GraphError
 from ._common import NO_TOKEN, odata_quote
 
+# Our own ceiling on how many results a list tool returns to the agent
+# (SOP: default <=50, hard cap <=200). Separate from Graph's own $top
+# per-page maximum, which is documented at 999 for /users and is used
+# below purely to size individual page requests.
+_DEFAULT_MAX_RESULTS = 50
+_HARD_CAP_MAX_RESULTS = 200
+_GRAPH_TOP_MAX = 999
+
+# Fields returned for each user in a list result. Deliberately narrower than
+# graph_get_user's $select: no license/manager expansion, since those cost an
+# extra join per user and a directory listing is a "find the right person"
+# step, not a profile read.
+_USER_LIST_SELECT = (
+    "id,displayName,userPrincipalName,mail,accountEnabled,jobTitle,department"
+)
+
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
 
@@ -52,6 +68,76 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             if users:
                 return dump_json_capped({"exists": True, "user": users[0]})
             return dump_json_capped({"exists": False, "user": None})
+        except GraphError as e:
+            return e.to_envelope()
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_list_users(
+        display_name: Annotated[
+            str | None,
+            Field(
+                description="Filter by display name; prefix match unless exact=True. "
+                "Omit to list all users (still capped by max_results)."
+            ),
+        ] = None,
+        exact: Annotated[
+            bool, Field(description="When True, match display_name exactly instead of by prefix.")
+        ] = False,
+        account_enabled: Annotated[
+            bool | None,
+            Field(
+                description="Keep only enabled (True) or only disabled (False) accounts. "
+                "Omit for both."
+            ),
+        ] = None,
+        max_results: Annotated[
+            int, Field(description="Max users to return (default 50, hard cap 200).")
+        ] = _DEFAULT_MAX_RESULTS,
+    ) -> str:
+        """List or search Entra ID users by display name.
+
+        Use to browse the directory or resolve a partial name to a user's
+        id/UPN for the other user tools — graph_check_user_exists needs an
+        exact UPN or mail, so it can't answer "who is called Alice?".
+        Returns id, displayName, userPrincipalName, mail, accountEnabled,
+        jobTitle and department for each match.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        max_results = min(max_results, _HARD_CAP_MAX_RESULTS)
+        params: dict = {
+            "$select": _USER_LIST_SELECT,
+            "$top": str(min(max_results, _GRAPH_TOP_MAX)),
+        }
+        clauses: list[str] = []
+        if display_name:
+            quoted = odata_quote(display_name)
+            if exact:
+                clauses.append(f"displayName eq '{quoted}'")
+            else:
+                clauses.append(f"startswith(displayName,'{quoted}')")
+        if account_enabled is not None:
+            clauses.append(f"accountEnabled eq {str(account_enabled).lower()}")
+        if clauses:
+            params["$filter"] = " and ".join(clauses)
+
+        try:
+            users: list = []
+            result = await client.get("/users", params=params)
+            has_more = False
+            while result:
+                users.extend(result.get("value", []))
+                if len(users) >= max_results:
+                    users = users[:max_results]
+                    has_more = True
+                    break
+                next_link = result.get("@odata.nextLink")
+                if not next_link:
+                    break
+                result = await client.get(next_link)
+            return dump_json_capped({"count": len(users), "users": users, "has_more": has_more})
         except GraphError as e:
             return e.to_envelope()
 

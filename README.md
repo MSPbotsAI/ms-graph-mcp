@@ -67,6 +67,7 @@ Connect your MCP client with:
 | Tool | 功能 | Required Scope |
 |---|---|---|
 | `graph_check_user_exists` | 按 UPN 或邮箱查询 Entra ID 用户是否存在 | `User.Read.All` |
+| `graph_list_users` | 列出/按显示名搜索 Entra ID 用户（前缀匹配，`exact=True` 改精确匹配），可按 `account_enabled` 过滤启用/禁用账号；默认返回 50 条、硬顶 200 条，分页走 `@odata.nextLink`，返回带 `has_more`。补的是「只知道名字片段、不知道准确 UPN」这个场景——`graph_check_user_exists` 要求准确 UPN/邮箱，答不了「有没有个叫 Alice 的」 | `User.Read.All` |
 | `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可 | `User.ReadWrite.All` |
 | `graph_get_user` | 读取用户完整资料，含 manager、已分配许可、以及每条许可的 `licenseAssignmentStates`（`assignedByGroup` 为 null=直接分配 / 非null=组分配继承） | `User.Read.All` |
 | `graph_update_user` | 更新用户属性（仅传入的字段会改动）；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
@@ -98,7 +99,7 @@ Connect your MCP client with:
 
 > **权限说明**：本文件里所有 SharePoint 工具全部只调用 Graph 的 `/sites/*` 和 `/drives/*` 端点，从不触碰 `/me/drive` 或 `/users/{id}/drive`。这类站点文档库驱动器接口，`Sites.*` 和 `Files.*` 是二选一的替代权限组，不是叠加要求——所以只需要 `Sites.Read.All`（只读工具）+ `Sites.ReadWrite.All`（写/建/删工具），完全不需要额外申请 `Files.ReadWrite.All`。
 
-> **实际申请的 scope**：上表逐个工具列的是各端点**最小**受理权限，便于按需裁剪；平台侧（MCP-Management-Service 的 `auth/oauth/vendors/msgraph.py`）实际向 Entra 申请的是能覆盖全部 29 个工具的并集：
+> **实际申请的 scope**：上表逐个工具列的是各端点**最小**受理权限，便于按需裁剪；平台侧（MCP-Management-Service 的 `auth/oauth/vendors/msgraph.py`）实际向 Entra 申请的是能覆盖全部 30 个工具的并集：
 >
 > ```
 > offline_access openid profile

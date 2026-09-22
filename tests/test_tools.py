@@ -15,6 +15,7 @@ from graph_mcp.server import create_mcp_server
 
 EXPECTED_TOOLS = {
     "graph_check_user_exists": set(),
+    "graph_list_users": set(),
     "graph_create_user": {
         "display_name",
         "user_principal_name",
@@ -84,7 +85,11 @@ async def test_tools_list_snapshot():
     # mailboxes, creating and cancelling an event are four distinct Graph
     # endpoints with disjoint arguments — merging any pair would mean one tool
     # whose required params depend on a mode flag, which reads worse to an agent.
-    assert len(names) <= 29, "tool count should stay within the SOP's <=20 guideline (+9 justified)"
+    # +1 for graph_list_users (PRD-19290): the user tools could all only act on
+    # a user you had already identified exactly — no way to enumerate or
+    # prefix-search the directory, which is a different question from
+    # graph_check_user_exists's "does this exact UPN exist".
+    assert len(names) <= 30, "tool count should stay within SOP's <=20 guideline (+10 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -189,6 +194,69 @@ async def test_user_lookup_escapes_apostrophe():
     client.calls.clear()
     await mcp.call_tool("graph_check_user_exists", {"mail": "o'brien@contoso.com"})
     assert client.calls[0][1]["$filter"] == "mail eq 'o''brien@contoso.com'"
+
+
+@pytest.mark.asyncio
+async def test_list_users_builds_filter_and_caps_results():
+    """display_name and account_enabled must combine into one `and` filter, the
+    apostrophe must be escaped like every other OData literal, and max_results
+    must be clamped to the 200 hard cap rather than passed through to $top."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_list_users", {"display_name": "O'Brien"})
+    assert client.calls[0][0] == "/users"
+    assert client.calls[0][1]["$filter"] == "startswith(displayName,'O''Brien')"
+
+    client.calls.clear()
+    await mcp.call_tool("graph_list_users", {"display_name": "Alice", "exact": True})
+    assert client.calls[0][1]["$filter"] == "displayName eq 'Alice'"
+
+    client.calls.clear()
+    await mcp.call_tool("graph_list_users", {"display_name": "Alice", "account_enabled": False})
+    assert (
+        client.calls[0][1]["$filter"]
+        == "startswith(displayName,'Alice') and accountEnabled eq false"
+    )
+
+    # No arguments at all => plain listing, no $filter key.
+    client.calls.clear()
+    await mcp.call_tool("graph_list_users", {})
+    assert "$filter" not in client.calls[0][1]
+
+    # Over the hard cap: $top must reflect the clamped 200, not the 5000 asked for.
+    client.calls.clear()
+    await mcp.call_tool("graph_list_users", {"max_results": 5000})
+    assert client.calls[0][1]["$top"] == "200"
+
+
+@pytest.mark.asyncio
+async def test_list_users_stops_paginating_at_max_results():
+    """A tenant with more users than max_results must come back truncated with
+    has_more=true, not walk every page of the directory."""
+    from graph_mcp.tools import users
+
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP(name="test")
+    client = _QueuedClient(
+        [
+            {
+                "value": [{"id": f"u{i}"} for i in range(50)],
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/users?$skiptoken=page2",
+            },
+            {"value": [{"id": f"v{i}"} for i in range(50)]},
+        ]
+    )
+    users.register(mcp, lambda: client)
+
+    _, structured = await mcp.call_tool("graph_list_users", {"max_results": 10})
+    payload = json.loads(structured["result"])
+
+    assert payload["count"] == 10
+    assert payload["has_more"] is True
+    # Only the first page was fetched — pagination stopped once the cap was hit.
+    assert len(client.calls) == 1
 
 
 @pytest.mark.asyncio
