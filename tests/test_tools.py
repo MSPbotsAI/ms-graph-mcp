@@ -37,6 +37,8 @@ EXPECTED_TOOLS = {
     "graph_check_license_stock": set(),
     "graph_assign_license": {"user_id"},
     "graph_send_mail": {"to_recipients", "subject", "body"},
+    "graph_list_messages": set(),
+    "graph_get_message": {"message_id"},
     "graph_search_sites": {"query"},
     "graph_list_drive_items": {"drive_id"},
     "graph_get_file": {"drive_id", "item_id"},
@@ -89,7 +91,12 @@ async def test_tools_list_snapshot():
     # a user you had already identified exactly — no way to enumerate or
     # prefix-search the directory, which is a different question from
     # graph_check_user_exists's "does this exact UPN exist".
-    assert len(names) <= 30, "tool count should stay within SOP's <=20 guideline (+10 justified)"
+    # +2 for the mail read pair (PRD-19103): the mail domain could only SEND.
+    # Listing and opening stay separate because a list must not carry bodies —
+    # that is the whole point of the split — and folding them into one tool
+    # whose return shape flips on whether message_id was passed is exactly the
+    # mode-flag shape the calendar note above rejects.
+    assert len(names) <= 32, "tool count should stay within SOP's <=20 guideline (+12 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -531,3 +538,125 @@ async def test_cancel_calendar_event_surfaces_other_errors():
     payload = json.loads(structured["result"])
     assert payload["error"]["code"] == "rate_limited"
     assert len(client.calls) == 1  # did not fall through to a delete
+
+
+def _mail_mcp(result: dict | None = None):
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import mail
+
+    mcp = FastMCP(name="test")
+    client = _CapturingClient(result)
+    mail.register(mcp, lambda: client)
+    return mcp, client
+
+
+@pytest.mark.asyncio
+async def test_list_messages_builds_filter_and_defaults_to_inbox():
+    mcp, client = _mail_mcp()
+
+    await mcp.call_tool(
+        "graph_list_messages",
+        {
+            "from_address": "o'brien@contoso.com",
+            "received_after": "2026-09-01T00:00:00Z",
+            "unread_only": True,
+            "limit": 5,
+        },
+    )
+    path, params = client.calls[0]
+    assert path == "/me/mailFolders/inbox/messages"
+    assert params["$filter"] == (
+        "from/emailAddress/address eq 'o''brien@contoso.com' and "
+        "receivedDateTime ge 2026-09-01T00:00:00Z and isRead eq false"
+    )
+    assert params["$orderby"] == "receivedDateTime desc"
+    assert params["$top"] == 5
+    # A list must never carry bodies — that is what graph_get_message is for.
+    assert "body" not in params["$select"].split(",")
+
+
+@pytest.mark.asyncio
+async def test_list_messages_across_all_folders_for_a_thread():
+    mcp, client = _mail_mcp()
+
+    await mcp.call_tool(
+        "graph_list_messages", {"folder": None, "conversation_id": "AAQk=", "user_id": "glenn@x.ai"}
+    )
+    path, params = client.calls[0]
+    assert path == "/users/glenn@x.ai/messages"
+    assert params["$filter"] == "conversationId eq 'AAQk='"
+
+
+@pytest.mark.asyncio
+async def test_list_messages_rejects_search_combined_with_filters():
+    """Graph rejects $search alongside $filter on messages with a 400 whose text
+    explains nothing. Catching it here costs one round trip less and tells the
+    agent what to do instead."""
+    mcp, client = _mail_mcp()
+
+    _, structured = await mcp.call_tool(
+        "graph_list_messages", {"search": "renewal", "unread_only": True}
+    )
+    payload = json.loads(structured["result"])
+    assert payload["error"]["code"] == "invalid_argument"
+    assert "unread_only" in payload["error"]["message"]
+    assert client.calls == []  # never reached Graph
+
+
+@pytest.mark.asyncio
+async def test_list_messages_search_quotes_term_and_drops_orderby():
+    mcp, client = _mail_mcp()
+
+    await mcp.call_tool("graph_list_messages", {"search": 'say "hi" to contoso'})
+    _, params = client.calls[0]
+    # An embedded quote would close the search literal early.
+    assert params["$search"] == '"say  hi  to contoso"'
+    assert "$orderby" not in params  # not accepted alongside $search
+
+
+@pytest.mark.asyncio
+async def test_list_messages_rejects_malformed_datetime():
+    mcp, client = _mail_mcp()
+
+    _, structured = await mcp.call_tool("graph_list_messages", {"received_after": "last Tuesday"})
+    payload = json.loads(structured["result"])
+    assert payload["error"]["code"] == "invalid_argument"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_message_truncates_a_huge_body():
+    """A single message has no list field for dump_json_capped to trim, so an
+    untruncated 400KB thread would be discarded wholesale and replaced by a
+    'too large' notice. The head of the message is what the agent actually
+    needs."""
+    from graph_mcp.tools.mail import _MAX_BODY_CHARS
+
+    long_body = "x" * (_MAX_BODY_CHARS + 5_000)
+    mcp, client = _mail_mcp(
+        {"id": "m1", "subject": "Re: renewal", "body": {"contentType": "text", "content": long_body}}
+    )
+
+    _, structured = await mcp.call_tool("graph_get_message", {"message_id": "m1"})
+    payload = json.loads(structured["result"])
+    body = payload["message"]["body"]
+    assert body["truncated"] is True
+    assert body["original_length"] == len(long_body)
+    assert len(body["content"]) == _MAX_BODY_CHARS
+    assert payload["message"]["subject"] == "Re: renewal"
+    # Plain text by default: HTML costs several times the tokens for the same words.
+    assert client.headers[0]["Prefer"] == 'outlook.body-content-type="text"'
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachments_never_pull_content_bytes():
+    mcp, client = _mail_mcp({"id": "m1", "value": [{"id": "a1", "name": "quote.pdf"}]})
+
+    await mcp.call_tool(
+        "graph_get_message", {"message_id": "m1", "include_attachments": True, "body_format": "html"}
+    )
+    assert client.calls[1][0] == "/me/messages/m1/attachments"
+    select = client.calls[1][1]["$select"]
+    assert "contentBytes" not in select
+    assert client.headers[0]["Prefer"] == 'outlook.body-content-type="html"'
