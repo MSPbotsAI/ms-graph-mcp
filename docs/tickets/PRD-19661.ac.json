@@ -1,0 +1,65 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given 调用方对 graph_send_mail 传入 1 个合法附件(文件名+可选类型+base64内容, 解码后 <=3MB), When 调用该工具, Then 发往 Graph 的请求体 message.attachments 含 1 项, 且 name/contentType/contentBytes 与入参逐字一致",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_attaches_one_file_correctly"]
+  },
+  {
+    "id": "TC2",
+    "ac": "AC2",
+    "text": "Given attachments 传了 5 个合法附件(单个与合计解码后均 <=3MB), When 调用, Then message.attachments 含全部 5 项, 各项 name/contentType/contentBytes 分别与对应入参一致",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_attaches_multiple_files_up_to_limit"]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC3",
+    "text": "Given 不传 attachments(省略参数, 或显式传 null/空列表), When 调用, Then 发往 Graph 的请求体里没有 attachments 键, 与改造前逐字节一致",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_without_attachments_matches_prior_payload_shape"]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC4",
+    "text": "Given 某附件的 content_base64 不是合法 base64, When 调用, Then 返回 invalid_argument 错误且错误信息点名是哪个 filename, 且假 client 记录的 HTTP 调用列表为空(未发起任何请求)",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_rejects_invalid_base64_attachment"]
+  },
+  {
+    "id": "TC5",
+    "ac": "AC5",
+    "text": "Given 单个附件解码后为 3,000,001 字节(超过 3MB 单文件上限 1 字节), When 调用, Then 返回 invalid_argument 错误且说明是单文件超限, 不发起任何 HTTP 请求",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_rejects_attachment_over_3mb"]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC5",
+    "text": "Given attachments 传了 6 个附件(超过 5 个数量上限), When 调用, Then 返回 invalid_argument 错误且说明是数量超限, 不发起任何 HTTP 请求",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_rejects_more_than_5_attachments"]
+  },
+  {
+    "id": "TC7",
+    "ac": "AC5",
+    "text": "Given 单个附件解码后恰好为 3,000,000 字节(等于上限, 边界值), When 调用, Then 校验放行, 请求正常发往 Graph(验证边界判断用的是大于而非大于等于)",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_allows_attachment_at_exactly_3mb_boundary"]
+  },
+  {
+    "id": "TC8",
+    "ac": "AC6",
+    "text": "Given attachments 里某一项缺少 filename 字段, When 调用, Then 返回 invalid_argument 错误且消息里点名缺失的字段是 filename, 不发起任何 HTTP 请求",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_rejects_attachment_missing_filename"]
+  },
+  {
+    "id": "TC9",
+    "ac": "AC7",
+    "text": "Given 连续两次调用 graph_send_mail, 各自使用不同的假 client(不同token/mailbox语境)与不同附件内容, When 依次调用, Then 第二次调用发往 Graph 的请求体不包含第一次调用的附件内容, 两次结果互不残留(验证工具无跨请求共享的可变状态)",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_attachments_do_not_leak_across_calls"]
+  }
+]
