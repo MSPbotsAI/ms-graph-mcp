@@ -660,3 +660,129 @@ async def test_get_message_attachments_never_pull_content_bytes():
     select = client.calls[1][1]["$select"]
     assert "contentBytes" not in select
     assert client.headers[0]["Prefer"] == 'outlook.body-content-type="html"'
+
+
+def _b64(n: int, fill: bytes = b"a") -> str:
+    import base64
+
+    return base64.b64encode(fill * n).decode()
+
+
+async def _send(mcp, **extra):
+    args = {"to_recipients": ["bob@contoso.com"], "subject": "s", "body": "b", **extra}
+    _, structured = await mcp.call_tool("graph_send_mail", args)
+    return json.loads(structured["result"])
+
+
+@pytest.mark.asyncio
+async def test_send_mail_attaches_one_file_correctly():
+    mcp, client = _mail_mcp({})
+    content = _b64(10)
+    result = await _send(
+        mcp,
+        attachments=[{"filename": "quote.pdf", "content_type": "application/pdf", "content_base64": content}],
+    )
+    assert result == {"status": "sent"}
+    assert client.calls[0][0] == "/me/sendMail"
+    assert client.bodies[0]["message"]["attachments"] == [
+        {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": "quote.pdf",
+            "contentType": "application/pdf",
+            "contentBytes": content,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_mail_attaches_multiple_files_up_to_limit():
+    mcp, client = _mail_mcp({})
+    atts = [{"filename": f"f{i}.txt", "content_base64": _b64(100, bytes([65 + i]))} for i in range(5)]
+    await _send(mcp, attachments=atts)
+    sent = client.bodies[0]["message"]["attachments"]
+    assert [a["name"] for a in sent] == [a["filename"] for a in atts]
+    assert [a["contentBytes"] for a in sent] == [a["content_base64"] for a in atts]
+    assert all(a["contentType"] == "application/octet-stream" for a in sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, []])
+async def test_send_mail_without_attachments_matches_prior_payload_shape(value):
+    mcp, client = _mail_mcp({})
+    await _send(mcp)
+    await _send(mcp, attachments=value)
+    expected = {
+        "message": {
+            "subject": "s",
+            "body": {"contentType": "Text", "content": "b"},
+            "toRecipients": [{"emailAddress": {"address": "bob@contoso.com"}}],
+        },
+        "saveToSentItems": True,
+    }
+    assert client.bodies == [expected, expected]
+
+
+@pytest.mark.asyncio
+async def test_send_mail_rejects_invalid_base64_attachment():
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"filename": "bad.bin", "content_base64": "not base64!!"}])
+    assert result["error"]["code"] == "invalid_argument"
+    assert "bad.bin" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_rejects_attachment_over_500kb():
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"filename": "big.pdf", "content_base64": _b64(500_001)}])
+    assert result["error"]["code"] == "invalid_argument"
+    assert "per-file" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_rejects_more_than_5_attachments():
+    mcp, client = _mail_mcp({})
+    atts = [{"filename": f"f{i}.txt", "content_base64": _b64(1)} for i in range(6)]
+    result = await _send(mcp, attachments=atts)
+    assert result["error"]["code"] == "invalid_argument"
+    assert "5 attachments max" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_allows_attachment_at_exactly_500kb_boundary():
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"filename": "edge.bin", "content_base64": _b64(500_000)}])
+    assert result == {"status": "sent"}
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_mail_rejects_attachment_missing_filename():
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"content_base64": _b64(1)}])
+    assert result["error"]["code"] == "invalid_argument"
+    assert "'filename'" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_attachments_do_not_leak_across_calls():
+    mcp1, client1 = _mail_mcp({})
+    mcp2, client2 = _mail_mcp({})
+    first = _b64(10, b"x")
+    await _send(mcp1, attachments=[{"filename": "one.txt", "content_base64": first}])
+    await _send(mcp2, attachments=[{"filename": "two.txt", "content_base64": _b64(10, b"y")}])
+    assert first not in json.dumps(client2.bodies)
+    assert [a["name"] for a in client2.bodies[0]["message"]["attachments"]] == ["two.txt"]
+
+
+@pytest.mark.asyncio
+async def test_send_mail_rejects_attachments_over_700kb_total():
+    mcp, client = _mail_mcp({})
+    atts = [{"filename": f"p{i}.bin", "content_base64": _b64(350_001)} for i in range(2)]
+    result = await _send(mcp, attachments=atts)
+    assert result["error"]["code"] == "invalid_argument"
+    assert "combined" in result["error"]["message"]
+    assert client.calls == []

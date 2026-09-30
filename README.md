@@ -82,7 +82,7 @@ Connect your MCP client with:
 | `graph_list_owned_groups` | 列出用户拥有的组，每个组附带总owner数——离职场景判断"这个用户是不是唯一owner"（`owner_count==1` 代表移除后立刻变孤儿组）。实现上先用 `/users/{id}` 把 user_id 解析成真实GUID，再全量分页拉 `/groups`、逐组调 `/groups/{id}/owners` 核对是否包含该用户——N+1，但这是目前唯一经真实租户验证可靠的路径：`/users/{id}/ownedObjects` 文档写明不支持app-only；`/groups?$filter=owners/any(...)` 会被Graph直接拒绝（`owners`不是Group上的可filter属性）；`/groups/delta` 选 `owners` 看似是文档记录的正解，但真实测试发现其分页有bug（同一批~200个组反复重复返回、`@odata.nextLink`根本没推进，与是否select owners无关），已放弃 | `Group.Read.All`（还需要 `User.Read.All` 解析user_id，已被现有`User.ReadWrite.All`覆盖） |
 | `graph_check_license_stock` | 查询租户已订阅 SKU 的许可库存与剩余数量 | `Organization.Read.All` |
 | `graph_assign_license` | 为用户分配和/或移除指定 SKU 许可（Graph 的 assignLicense 接口一次调用同时支持增删，两者合并进这一个 tool） | `User.ReadWrite.All` |
-| `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC 及 HTML 正文 | `Mail.Send`；带 `sender_id`（代他人/共享邮箱发信）另需 `Mail.Send.Shared` |
+| `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC、HTML 正文及内联附件（base64，≤500 KB/文件，合计 ≤700 KB，最多 5 个） | `Mail.Send`；带 `sender_id`（代他人/共享邮箱发信）另需 `Mail.Send.Shared` |
 | `graph_list_messages` | 列出/搜索某个邮箱的邮件，只回元数据 + `bodyPreview`，不带正文；默认收件箱、按收件时间倒序，可按发件人/会话/时间窗/未读/有无附件过滤，也可 `search` 全文检索。`folder=null` 跨全部文件夹，配合 `conversation_id` 才能看到整条线程（含自己发出去的回复）。只取第一页，返回带 `has_more` | `Mail.Read`（读别人的邮箱：app-only 权限，或委派下该邮箱已共享给调用者，见 `Mail.Read.Shared`） |
 | `graph_get_message` | 读单封邮件全文（含正文）。默认让 Exchange 把正文压成纯文本（`Prefer: outlook.body-content-type`），比 HTML 省好几倍 token；正文超过 15,000 字符会截断并标 `truncated`/`original_length`。`include_attachments=true` 另跑一次附件列表，只回名称/类型/大小，**绝不回 `contentBytes`** | `Mail.Read`（同上） |
 | `graph_search_sites` | 按名称/关键词搜索 SharePoint 站点，结果自动带出每个站点默认文档库的 driveId（最多补前5条） | `Sites.Read.All` |

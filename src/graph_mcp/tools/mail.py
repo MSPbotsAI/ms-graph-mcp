@@ -19,6 +19,8 @@ So under the delegated grant, omit user_id and you read your own mail; pass
 someone else's and expect `unauthorized` unless the sharing is in place.
 """
 
+import base64
+import binascii
 import re
 from collections.abc import Callable
 from typing import Annotated, Literal
@@ -56,7 +58,78 @@ _USER_ID_DESC = (
     "must always pass this."
 )
 
+# Inline attachments arrive as a base64 tool argument, so the calling agent has
+# to hold (and emit) every byte in its own context first — same reasoning as
+# sites.py's _MAX_WRITE_BYTES, and the per-file cap matches it. The combined
+# cap is set by the gateway's front nginx (default client_max_body_size 1m):
+# 700 KB decoded is ~933 KB of base64, leaving ~110 KB for the body, recipients
+# and JSON-RPC envelope. Raise _MAX_TOTAL_ATTACHMENT_BYTES only after that
+# nginx limit is raised. Graph's own ~4 MB sendMail request limit is far above.
+_MAX_ATTACHMENT_BYTES = 500_000
+_MAX_TOTAL_ATTACHMENT_BYTES = 700_000
+_MAX_ATTACHMENTS = 5
+
 _ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+
+
+def _build_attachments(attachments: list[dict]) -> list[dict] | str:
+    """Validate inline attachments and map them to Graph fileAttachment dicts.
+
+    Returns the list, or an invalid_argument envelope string — checked before
+    any request goes out, so a bad attachment never sends a mail without it.
+    """
+    if len(attachments) > _MAX_ATTACHMENTS:
+        return error_envelope(
+            "invalid_argument",
+            f"{_MAX_ATTACHMENTS} attachments max per call, got {len(attachments)}",
+            False,
+        )
+    built: list[dict] = []
+    total = 0
+    for i, att in enumerate(attachments):
+        if not isinstance(att, dict):
+            return error_envelope("invalid_argument", f"attachments[{i}] must be an object", False)
+        for key in ("filename", "content_base64"):
+            if not att.get(key):
+                return error_envelope(
+                    "invalid_argument", f"attachments[{i}] missing required field '{key}'", False
+                )
+        filename = att["filename"]
+        try:
+            size = len(base64.b64decode(att["content_base64"], validate=True))
+        except (binascii.Error, ValueError, TypeError) as e:
+            return error_envelope(
+                "invalid_argument",
+                f"attachments[{i}] ('{filename}') is not valid base64: {e}",
+                False,
+            )
+        if size > _MAX_ATTACHMENT_BYTES:
+            return error_envelope(
+                "invalid_argument",
+                f"attachment '{filename}' is {size} bytes decoded, exceeds the "
+                f"{_MAX_ATTACHMENT_BYTES:,}-byte (500 KB) per-file limit for inline attachments "
+                "— compress the file or share a link instead",
+                False,
+            )
+        total += size
+        built.append(
+            {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": filename,
+                "contentType": att.get("content_type") or "application/octet-stream",
+                # Graph takes base64 as-is; no need to re-encode the decoded bytes.
+                "contentBytes": att["content_base64"],
+            }
+        )
+    if total > _MAX_TOTAL_ATTACHMENT_BYTES:
+        return error_envelope(
+            "invalid_argument",
+            f"attachments total {total} bytes decoded, exceeds the "
+            f"{_MAX_TOTAL_ATTACHMENT_BYTES:,}-byte (700 KB) combined limit; "
+            "send in multiple emails or fewer/smaller attachments",
+            False,
+        )
+    return built
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -89,6 +162,12 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         save_to_sent_items: Annotated[
             bool, Field(description="Whether to save a copy in Sent Items.")
         ] = True,
+        attachments: Annotated[
+            list[dict] | None,
+            Field(
+                description='Optional file attachments, up to 5: [{"filename": "quote.pdf", "content_base64": "<standard base64>", "content_type": "application/pdf"}]. content_type defaults to application/octet-stream. Max 500 KB per file and 700 KB total, decoded. If any attachment is invalid nothing is sent.'
+            ),
+        ] = None,
     ) -> str:
         """Send an email as an Entra ID user via Microsoft Graph.
 
@@ -112,6 +191,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             message["ccRecipients"] = _addr_list(cc_recipients)
         if bcc_recipients:
             message["bccRecipients"] = _addr_list(bcc_recipients)
+        if attachments:
+            built = _build_attachments(attachments)
+            if isinstance(built, str):
+                return built
+            message["attachments"] = built
 
         payload = {
             "message": message,
