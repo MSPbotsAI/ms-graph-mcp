@@ -39,6 +39,7 @@ EXPECTED_TOOLS = {
     "graph_send_mail": {"to_recipients", "subject", "body"},
     "graph_list_messages": set(),
     "graph_get_message": {"message_id"},
+    "graph_read_mail_attachment": {"message_id", "attachment_id"},
     "graph_search_sites": {"query"},
     "graph_list_drive_items": {"drive_id"},
     "graph_get_file": {"drive_id", "item_id"},
@@ -96,7 +97,11 @@ async def test_tools_list_snapshot():
     # that is the whole point of the split — and folding them into one tool
     # whose return shape flips on whether message_id was passed is exactly the
     # mode-flag shape the calendar note above rejects.
-    assert len(names) <= 32, "tool count should stay within SOP's <=20 guideline (+12 justified)"
+    # +1 for graph_read_mail_attachment: the mail flow listed attachments but
+    # could not open one, so a spreadsheet emailed in was a dead end. It stays
+    # separate from graph_get_message because it returns file content, not a
+    # message, and pages by row.
+    assert len(names) <= 33, "tool count should stay within SOP's <=20 guideline (+13 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -786,3 +791,129 @@ async def test_send_mail_rejects_attachments_over_700kb_total():
     assert result["error"]["code"] == "invalid_argument"
     assert "combined" in result["error"]["message"]
     assert client.calls == []
+
+
+class _AttachmentClient(_CapturingClient):
+    def __init__(self, meta: dict, data: bytes = b""):
+        super().__init__(meta)
+        self.data = data
+        self.content_paths: list[str] = []
+
+    async def get_content(self, path: str) -> bytes:
+        self.content_paths.append(path)
+        return self.data
+
+
+def _xlsx(sheets: dict[str, list[list]]) -> bytes:
+    import io
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for title, rows in sheets.items():
+        ws = wb.create_sheet(title)
+        for row in rows:
+            ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+async def _read_attachment(meta: dict, data: bytes = b"", **args):
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import mail
+
+    mcp = FastMCP(name="test")
+    client = _AttachmentClient(meta, data)
+    mail.register(mcp, lambda: client)
+    _, structured = await mcp.call_tool(
+        "graph_read_mail_attachment", {"message_id": "m1", "attachment_id": "a1", **args}
+    )
+    return json.loads(structured["result"]), client
+
+
+def _file_meta(name: str, size: int = 1000) -> dict:
+    return {"@odata.type": "#microsoft.graph.fileAttachment", "name": name, "size": size}
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_parses_xlsx_rows():
+    import datetime as dt
+
+    data = _xlsx(
+        {
+            "Summary": [["Client", "Hours", "Date"], ["Contoso", 12.5, dt.date(2026, 10, 1)]],
+            "Raw": [["x"]],
+        }
+    )
+    payload, client = await _read_attachment(_file_meta("report.xlsx", len(data)), data)
+    assert payload["sheets"] == ["Summary", "Raw"]
+    assert payload["sheet"] == "Summary"
+    assert payload["rows"][0] == ["Client", "Hours", "Date"]
+    assert payload["rows"][1][:2] == ["Contoso", 12.5]
+    assert payload["rows"][1][2].startswith("2026-10-01")
+    assert payload["total_rows"] == 2 and payload["has_more"] is False
+    # Metadata first without contentBytes, then the raw $value stream.
+    assert "contentBytes" not in client.calls[0][1]["$select"]
+    assert client.content_paths == ["/me/messages/m1/attachments/a1/$value"]
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_picks_sheet_and_pages():
+    data = _xlsx({"A": [["h"]], "B": [["h"]] + [[i] for i in range(1, 11)]})
+    payload, _ = await _read_attachment(
+        _file_meta("r.xlsx"), data, sheet="B", start_row=4, max_rows=3, user_id="u@x.ai"
+    )
+    assert payload["sheet"] == "B"
+    assert payload["rows"] == [[3], [4], [5]]
+    assert payload["total_rows"] == 11 and payload["has_more"] is True
+
+    payload, _ = await _read_attachment(_file_meta("r.xlsx"), data, sheet="Nope")
+    assert payload["error"]["code"] == "invalid_argument"
+    assert "A" in payload["error"]["message"] and "B" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_shrinks_page_to_fit_and_keeps_counters_true():
+    from graph_mcp._json import MAX_CHARS
+
+    wide = [["y" * 250] * 4 for _ in range(200)]
+    data = _xlsx({"S": wide})
+    payload, _ = await _read_attachment(_file_meta("big.xlsx"), data)
+    n = payload["returned_rows"]
+    assert 0 < n < 200
+    assert len(payload["rows"]) == n
+    assert payload["has_more"] is True
+    assert len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False)) <= MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_csv_and_text():
+    payload, _ = await _read_attachment(
+        _file_meta("t.csv"), "\ufeffname,qty\n\nwidget,3\n".encode()
+    )
+    assert payload["rows"] == [["name", "qty"], ["widget", "3"]]
+
+    payload, _ = await _read_attachment(_file_meta("notes.txt"), "hello 你好".encode())
+    assert payload["content"] == "hello 你好"
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_rejects_unsupported_before_downloading():
+    for meta in (
+        _file_meta("contract.pdf"),
+        _file_meta("legacy.xls"),
+        _file_meta("huge.xlsx", 50 * 1024 * 1024),
+        {"@odata.type": "#microsoft.graph.itemAttachment", "name": "Fwd: hi", "size": 10},
+    ):
+        payload, client = await _read_attachment(meta, b"")
+        assert payload["error"]["code"] == "invalid_argument", meta
+        assert client.content_paths == []
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_reports_corrupt_xlsx():
+    payload, _ = await _read_attachment(_file_meta("bad.xlsx"), b"not a zip")
+    assert payload["error"]["code"] == "invalid_argument"
