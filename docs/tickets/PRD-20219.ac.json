@@ -1,0 +1,229 @@
+[
+  {
+    "id": "TC-MSG-001",
+    "ac": "AC9",
+    "type": "auto",
+    "source": "design",
+    "text": "graph_create_user called with all 9 new optional params produces a Graph POST /users body containing all 9 corresponding Graph field names with the given values.",
+    "tests": ["tests/test_tools.py::test_graph_create_user_includes_new_optional_fields"],
+    "result": "untested",
+    "notes": "Not implemented yet; test to be written alongside the code change."
+  },
+  {
+    "id": "TC-MSG-002",
+    "ac": "AC9",
+    "type": "auto",
+    "source": "design",
+    "text": "graph_create_user called with none of the 9 new params produces the same POST /users body as before this change (no regression).",
+    "tests": ["tests/test_tools.py::test_graph_create_user_body_unchanged_without_new_fields"],
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-003",
+    "ac": "AC9",
+    "type": "manual",
+    "source": "design",
+    "text": "Against a real Entra test tenant, a user created via graph_create_user with company_name=\"Acme\" and employee_hire_date=\"2026-10-20T00:00:00Z\" shows companyName: \"Acme\" and employeeHireDate: 2026-10-20T00:00:00Z when read back via graph_get_user.",
+    "steps": [
+      "Call graph_create_user with required fields plus company_name=\"Acme\" and employee_hire_date=\"2026-10-20T00:00:00Z\" against a non-production Entra test tenant.",
+      "Call graph_get_user with the returned user id."
+    ],
+    "expect": "graph_get_user's response shows companyName=\"Acme\" and employeeHireDate=\"2026-10-20T00:00:00Z\".",
+    "result": "untested",
+    "notes": "Requires a non-production Entra tenant with Graph app credentials; owner not established in this design."
+  },
+  {
+    "id": "TC-MSG-004",
+    "ac": "AC10",
+    "type": "auto",
+    "source": "design",
+    "text": "graph_update_user called with only street_address produces a PATCH /users/{id} body containing exactly {\"streetAddress\": ...} -- no other field keys present.",
+    "tests": ["tests/test_tools.py::test_graph_update_user_street_address_only"],
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-005",
+    "ac": "AC10",
+    "type": "manual",
+    "source": "design",
+    "text": "Against a real Entra test tenant, updating an existing user's city/state/postal_code via graph_update_user and reading it back via graph_get_user shows the new values and leaves department/job_title unchanged.",
+    "steps": [
+      "Pick an existing test-tenant user with known department/job_title.",
+      "Call graph_update_user(user_id, city=..., state=..., postal_code=...).",
+      "Call graph_get_user(user_id)."
+    ],
+    "expect": "city/state/postalCode reflect the new values; department and jobTitle are unchanged from before the call.",
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-006",
+    "ac": "AC11",
+    "type": "auto",
+    "source": "design",
+    "text": "graph_list_domains issues GET /domains with no request body and returns the mocked response's value array unmodified.",
+    "tests": ["tests/test_tools.py::test_graph_list_domains_calls_domains_endpoint"],
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-007",
+    "ac": "AC11",
+    "type": "manual",
+    "source": "design",
+    "text": "Against a real Entra test tenant with >= 2 verified domains, graph_list_domains returns both.",
+    "steps": ["Call graph_list_domains against a test tenant known to have >= 2 verified domains."],
+    "expect": "Response lists both known domains.",
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-008",
+    "ac": "AC12",
+    "type": "auto",
+    "source": "design",
+    "text": "graph_get_group(\"00000000-0000-0000-0000-000000000000\") issues GET /groups/00000000-0000-0000-0000-000000000000.",
+    "tests": ["tests/test_tools.py::test_graph_get_group_targets_correct_endpoint"],
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-009",
+    "ac": "AC12",
+    "type": "auto",
+    "source": "design",
+    "text": "graph_get_group called against a mocked 404 response returns the same GraphError.to_envelope() shape graph_get_user returns for a missing user (error-path parity).",
+    "tests": ["tests/test_tools.py::test_graph_get_group_404_error_envelope"],
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-010",
+    "ac": "AC13",
+    "type": "auto",
+    "source": "design",
+    "text": "graph_reprocess_license(user_id) issues POST /users/{user_id}/reprocessLicenseAssignment with an empty body and returns a success envelope on HTTP 204.",
+    "tests": ["tests/test_tools.py::test_graph_reprocess_license_success"],
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-011",
+    "ac": "AC13",
+    "type": "manual",
+    "source": "design",
+    "text": "Against a real Entra test tenant, a user with a stuck license assignment shows the assignment reprocessed (or the tool reports Graph's error) after calling graph_reprocess_license.",
+    "steps": ["Identify or simulate a test-tenant user with a failed/pending license assignment.", "Call graph_reprocess_license(user_id)."],
+    "expect": "License assignment state changes to processed, or the tool surfaces Graph's error envelope if Graph itself rejects the reprocess.",
+    "result": "untested"
+  },
+  {
+    "id": "TC-MSG-012",
+    "ac": "AC9,AC10,AC11,AC12,AC13",
+    "type": "auto",
+    "source": "design",
+    "text": "tests/test_tools.py's EXPECTED_TOOLS snapshot test passes with the 2 new tool entries added and no existing entries changed (regression guard for the whole tool inventory).",
+    "tests": ["tests/test_tools.py::test_tool_inventory_matches_expected"],
+    "result": "untested"
+  },
+  {
+    "id": "TC-ITG-001",
+    "ac": "AC1",
+    "type": "manual",
+    "source": "design",
+    "text": "Blocked on Open Question Q2 -- cannot execute until an MSPbots-owned IT Glue repo exists.",
+    "steps": ["N/A until Q2 resolved."],
+    "expect": "Given a tenant with IT Glue connected, calling the password-create tool with organization_id/name/username/password/notes/password_category_id creates a new password record and returns its id.",
+    "result": "blocked",
+    "notes": "Blocked on Open Question Q2 (no MSPbots-owned itglue repo exists yet)."
+  },
+  {
+    "id": "TC-ITG-002",
+    "ac": "AC2",
+    "type": "manual",
+    "source": "design",
+    "text": "Blocked on Open Question Q2.",
+    "steps": ["N/A until Q2 resolved."],
+    "expect": "Given an existing password record for a username, calling the password-update tool updates it in place (no duplicate) and returns its id.",
+    "result": "blocked",
+    "notes": "Blocked on Open Question Q2."
+  },
+  {
+    "id": "TC-CWM-001",
+    "ac": "AC3",
+    "type": "manual",
+    "source": "design",
+    "text": "Against a real ConnectWise Manage sandbox, cw_update_contact(id, [{\"op\":\"replace\",\"path\":\"inactiveFlag\",\"value\":true}]) followed by cw_get_contact(id) shows inactiveFlag: true -- confirms the already-satisfied finding before groom relies on it.",
+    "steps": [
+      "Pick an existing active contact in a ConnectWise Manage sandbox.",
+      "Call cw_update_contact(id, [{\"op\":\"replace\",\"path\":\"inactiveFlag\",\"value\":true}]).",
+      "Call cw_get_contact(id)."
+    ],
+    "expect": "cw_get_contact response shows inactiveFlag: true.",
+    "result": "untested",
+    "notes": "Code-level evidence already gathered (contacts.ts:133-148); live-tenant confirmation not executed in this design leg (no ConnectWise sandbox credentials available here)."
+  },
+  {
+    "id": "TC-CWM-002",
+    "ac": "AC4",
+    "type": "manual",
+    "source": "design",
+    "text": "Blocked on Open Question Q2.",
+    "steps": ["N/A until Q2 resolved."],
+    "expect": "cw_create_contact accepts types/site/addressLine1/addressLine2/city/state/zip/department/managerContact and the created contact has them set.",
+    "result": "blocked",
+    "notes": "Blocked on Open Question Q2."
+  },
+  {
+    "id": "TC-CWM-003",
+    "ac": "AC5",
+    "type": "manual",
+    "source": "design",
+    "text": "Blocked on Open Question Q2.",
+    "steps": ["N/A until Q2 resolved."],
+    "expect": "A single tool call sets mobile, work, and extension communication items on a contact without requiring the caller to resend existing items.",
+    "result": "blocked",
+    "notes": "Blocked on Open Question Q2."
+  },
+  {
+    "id": "TC-CWM-004",
+    "ac": "AC6",
+    "type": "manual",
+    "source": "design",
+    "text": "Blocked on Open Question Q2.",
+    "steps": ["N/A until Q2 resolved."],
+    "expect": "cw_list_sites(company_id) returns the company's site list matching GET /company/companies/{id}/sites.",
+    "result": "blocked",
+    "notes": "Blocked on Open Question Q2."
+  },
+  {
+    "id": "TC-CWM-005",
+    "ac": "AC7",
+    "type": "manual",
+    "source": "design",
+    "text": "Against a real ConnectWise Manage sandbox, cw_search_contacts(childConditions='communicationItems/value=\"<known-email>\"') returns exactly the one contact with that email -- confirms the already-satisfied finding before groom relies on it.",
+    "steps": [
+      "Pick a contact in a ConnectWise Manage sandbox with a known, unique email.",
+      "Call cw_search_contacts(childConditions='communicationItems/value=\"<that email>\"')."
+    ],
+    "expect": "Response contains exactly one contact: the one with that email.",
+    "result": "untested",
+    "notes": "Code-level evidence already gathered (contact-search.ts childConditions passthrough); live-tenant confirmation not executed in this design leg."
+  },
+  {
+    "id": "TC-CWM-006",
+    "ac": "AC8",
+    "type": "manual",
+    "source": "design",
+    "text": "Blocked on Open Question Q2.",
+    "steps": ["N/A until Q2 resolved."],
+    "expect": "cw_list_contact_types() returns the full contact-type list matching GET /company/contacts/types.",
+    "result": "blocked",
+    "notes": "Blocked on Open Question Q2."
+  },
+  {
+    "id": "TC-OPS-001",
+    "ac": "AC14",
+    "type": "manual",
+    "source": "design",
+    "text": "Not a dev-leg test case -- tracked so groom can route it to whoever owns tenant onboarding ops.",
+    "steps": ["Obtain the tenant's IT Glue API key and itglue_org_id.", "Submit the existing IT Glue credential form for that tenant."],
+    "expect": "Connector status changes from installed_disconnected to connected.",
+    "result": "blocked",
+    "notes": "Operational task, not an engineering change; no Code Project applies."
+  }
+]
