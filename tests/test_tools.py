@@ -904,7 +904,6 @@ async def test_read_attachment_csv_and_text():
 async def test_read_attachment_rejects_unsupported_before_downloading():
     for meta in (
         _file_meta("contract.pdf"),
-        _file_meta("legacy.xls"),
         _file_meta("huge.xlsx", 50 * 1024 * 1024),
         {"@odata.type": "#microsoft.graph.itemAttachment", "name": "Fwd: hi", "size": 10},
     ):
@@ -915,5 +914,66 @@ async def test_read_attachment_rejects_unsupported_before_downloading():
 
 @pytest.mark.asyncio
 async def test_read_attachment_reports_corrupt_xlsx():
-    payload, _ = await _read_attachment(_file_meta("bad.xlsx"), b"not a zip")
+    payload, _ = await _read_attachment(_file_meta("bad.xlsx"), b"PK\x03\x04 truncated zip")
+    assert payload["error"]["code"] == "invalid_argument"
+
+
+def _xls(rows: list[list]) -> bytes:
+    import io
+
+    import xlwt
+
+    book = xlwt.Workbook()
+    ws = book.add_sheet("Data")
+    date_style = xlwt.easyxf(num_format_str="YYYY-MM-DD")
+    for r, row in enumerate(rows):
+        for c, value in enumerate(row):
+            if hasattr(value, "year"):
+                ws.write(r, c, value, date_style)
+            else:
+                ws.write(r, c, value)
+    buf = io.BytesIO()
+    book.save(buf)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_parses_legacy_xls():
+    import datetime as dt
+
+    data = _xls([["Client", "Qty", "Date"], ["Contoso", 3, dt.datetime(2026, 10, 1)]])
+    payload, _ = await _read_attachment(_file_meta("old.xls"), data)
+    assert payload["format"] == "xls"
+    assert payload["sheets"] == ["Data"]
+    assert payload["rows"][0] == ["Client", "Qty", "Date"]
+    # Whole numbers stay ints (xlrd hands back 3.0) and dates are not raw serials.
+    assert payload["rows"][1] == ["Contoso", 3, "2026-10-01T00:00:00"]
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_detects_format_from_content_not_name():
+    # An .xlsx renamed .xls, and one with no extension at all.
+    data = _xlsx({"S": [["a", "b"]]})
+    for name in ("renamed.xls", "export"):
+        payload, _ = await _read_attachment(_file_meta(name), data)
+        assert payload["format"] == "xlsx" and payload["rows"] == [["a", "b"]], name
+
+    # A real .xls named .xlsx.
+    payload, _ = await _read_attachment(_file_meta("wrong.xlsx"), _xls([["x", 1]]))
+    assert payload["format"] == "xls" and payload["rows"] == [["x", 1]]
+
+    # Reporting systems often export tab-separated text as .xls.
+    payload, _ = await _read_attachment(_file_meta("report.xls"), b"name\tqty\nwidget\t3\n")
+    assert payload["format"] == "csv"
+    assert payload["rows"] == [["name", "qty"], ["widget", "3"]]
+
+    # ...or an HTML table; returned as text rather than mangled into rows.
+    payload, _ = await _read_attachment(_file_meta("report.xls"), b"<html><table></table></html>")
+    assert payload["format"] == "text"
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_rejects_ole_file_that_is_not_xls():
+    ole_garbage = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 600
+    payload, _ = await _read_attachment(_file_meta("x.xls"), ole_garbage)
     assert payload["error"]["code"] == "invalid_argument"

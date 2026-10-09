@@ -32,10 +32,10 @@ import datetime as dt
 import io
 import json
 import re
-import zipfile
 from collections.abc import Callable
 from typing import Annotated, Literal
 
+import xlrd
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from openpyxl import load_workbook
@@ -70,8 +70,15 @@ _MAX_ATTACHMENT_READ_BYTES = 20 * 1024 * 1024
 _MAX_SHEET_ROWS = 500
 _MAX_CELL_CHARS = 300
 _MAX_TEXT_CHARS = 15_000
-_SPREADSHEET_EXTS = (".xlsx", ".xlsm")
-_TEXT_EXTS = (".csv", ".tsv", ".txt", ".md", ".json", ".xml", ".html", ".htm", ".log")
+# The format is decided from the file's leading bytes, not its name: what
+# users mail in is often an .xlsx renamed .xls, an HTML/tab-separated export
+# named .xls, or a file with no extension at all. The name only short-circuits
+# types that are certainly not tabular/text, so they are never downloaded.
+_ZIP_MAGIC = b"PK\x03\x04"
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_SKIP_EXTS = tuple(
+    ".pdf .doc .docx .ppt .pptx .png .jpg .jpeg .gif .zip .rar .7z .msg .eml .mp4 .mov".split()
+)
 
 _USER_ID_DESC = (
     "Mailbox to read (id (GUID) or userPrincipalName). Omit to use the token's own "
@@ -172,49 +179,102 @@ def _trim_row(row) -> list:
     return cells
 
 
-def _read_workbook(data: bytes, sheet: str | None, start_row: int, max_rows: int) -> dict | str:
-    """Parse an .xlsx into one page of rows from one sheet.
+def _page_rows(rows, start_row: int, max_rows: int) -> dict:
+    """One page of non-blank rows. Blank rows are skipped rather than returned
+    as [], and row numbers count only non-blank rows, so start_row paging stays
+    stable whichever format the rows came from."""
+    page: list[list] = []
+    total = 0
+    for raw in rows:
+        cells = _trim_row(raw)
+        if not cells:
+            continue
+        total += 1
+        if total >= start_row and len(page) < max_rows:
+            page.append(cells)
+    return {
+        "total_rows": total,
+        "start_row": start_row,
+        "returned_rows": len(page),
+        "has_more": start_row - 1 + len(page) < total,
+        "rows": page,
+    }
 
-    data_only=True returns the values Excel last calculated, not formula text —
-    what a person sees in the cell. A workbook saved by a tool that never
-    calculates (some exporters) has no cached values, so formula cells read None.
+
+def _pick_sheet(names: list[str], sheet: str | None) -> int | str:
+    if sheet is None:
+        return 0
+    if sheet in names:
+        return names.index(sheet)
+    return error_envelope(
+        "invalid_argument", f"No sheet named {sheet!r}; sheets are {names}", False
+    )
+
+
+def _read_xlsx(data: bytes, sheet: str | None, start_row: int, max_rows: int) -> dict | str:
+    """.xlsx/.xlsm. data_only=True returns the values Excel last calculated, not
+    formula text — what a person sees in the cell. A workbook saved by a tool that
+    never calculates (some exporters) has no cached values, so formulas read None.
     """
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    except (zipfile.BadZipFile, KeyError, ValueError, OSError) as e:
-        return error_envelope("invalid_argument", f"Not a readable .xlsx workbook: {e}", False)
+    except Exception as e:  # same reasoning as _read_xls: malformed input, many error types
+        return error_envelope(
+            "invalid_argument",
+            f"A zip-based file but not a readable Excel workbook (.docx/.pptx?): {e}",
+            False,
+        )
     try:
         names = wb.sheetnames
-        if sheet is None:
-            ws = wb.worksheets[0]
-        elif sheet in names:
-            ws = wb[sheet]
-        else:
-            return error_envelope(
-                "invalid_argument", f"No sheet named {sheet!r}; sheets are {names}", False
-            )
-        rows: list[list] = []
-        total = 0
-        # Blank rows are skipped rather than returned as [], and row numbers
-        # count only non-blank rows, so start_row paging stays stable.
-        for raw in ws.iter_rows(values_only=True):
-            cells = _trim_row(raw)
-            if not cells:
-                continue
-            total += 1
-            if total >= start_row and len(rows) < max_rows:
-                rows.append(cells)
-        return {
-            "sheets": names,
-            "sheet": ws.title,
-            "total_rows": total,
-            "start_row": start_row,
-            "returned_rows": len(rows),
-            "has_more": start_row - 1 + len(rows) < total,
-            "rows": rows,
-        }
+        idx = _pick_sheet(names, sheet)
+        if isinstance(idx, str):
+            return idx
+        ws = wb.worksheets[idx]
+        page = _page_rows(ws.iter_rows(values_only=True), start_row, max_rows)
+        return {"format": "xlsx", "sheets": names, "sheet": ws.title, **page}
     finally:
         wb.close()
+
+
+def _xls_value(cell, datemode: int):
+    if cell.ctype == xlrd.XL_CELL_DATE:
+        try:
+            return xlrd.xldate_as_datetime(cell.value, datemode)
+        except (ValueError, OverflowError, xlrd.xldate.XLDateError):
+            return cell.value
+    if cell.ctype == xlrd.XL_CELL_NUMBER and float(cell.value).is_integer():
+        return int(cell.value)
+    if cell.ctype == xlrd.XL_CELL_BOOLEAN:
+        return bool(cell.value)
+    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK, xlrd.XL_CELL_ERROR):
+        return None
+    return cell.value
+
+
+def _read_xls(data: bytes, sheet: str | None, start_row: int, max_rows: int) -> dict | str:
+    """Legacy binary .xls (Excel 97-2003). The same OLE container also holds
+    .doc and password-protected .xlsx, which xlrd cannot open."""
+    try:
+        book = xlrd.open_workbook(file_contents=data, on_demand=True)
+    # xlrd raises CompDocError, AssertionError, struct.error and more on
+    # malformed containers; any of them just means "not a readable .xls".
+    except Exception as e:
+        return error_envelope(
+            "invalid_argument",
+            f"Not a readable .xls workbook (password-protected, or a .doc?): {e}",
+            False,
+        )
+    try:
+        names = book.sheet_names()
+        idx = _pick_sheet(names, sheet)
+        if isinstance(idx, str):
+            return idx
+        ws = book.sheet_by_index(idx)
+        rows = ([_xls_value(c, book.datemode) for c in ws.row(r)] for r in range(ws.nrows))
+        page = _page_rows(rows, start_row, max_rows)
+        return {"format": "xls", "sheets": names, "sheet": ws.name, **page}
+    finally:
+        book.release_resources()
 
 
 def _dump_rows(payload: dict) -> str:
@@ -247,23 +307,21 @@ def _decode_text(data: bytes) -> str | None:
     return None
 
 
-def _read_delimited(text: str, delimiter: str, start_row: int, max_rows: int) -> dict:
-    rows: list[list] = []
-    total = 0
-    for raw in csv.reader(io.StringIO(text), delimiter=delimiter):
-        cells = _trim_row(raw)
-        if not cells:
-            continue
-        total += 1
-        if total >= start_row and len(rows) < max_rows:
-            rows.append(cells)
-    return {
-        "total_rows": total,
-        "start_row": start_row,
-        "returned_rows": len(rows),
-        "has_more": start_row - 1 + len(rows) < total,
-        "rows": rows,
-    }
+def _delimiter(lower_name: str, text: str) -> str | None:
+    """Delimiter for text that is really a table, or None for plain text.
+    Besides .csv/.tsv, an .xls that turned out to be text is usually a
+    tab-separated export from some reporting system."""
+    if lower_name.endswith(".csv"):
+        return ","
+    if lower_name.endswith(".tsv"):
+        return "\t"
+    if lower_name.endswith((".xls", ".xlsx")) and not text.lstrip().startswith("<"):
+        first = text.split("\n", 1)[0]
+        if "\t" in first:
+            return "\t"
+        if "," in first:
+            return ","
+    return None
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -584,11 +642,12 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     ) -> str:
         """Read the content of a file attached to an email — Excel sheets as rows.
 
-        .xlsx/.xlsm come back as rows of cell values from one sheet (first
-        row is usually the header), with every sheet name listed;
-        .csv/.tsv as rows; .txt/.json and similar as text. Large sheets
-        page via start_row. Other types (.pdf/.docx/.xls) are rejected —
-        the file itself is never returned.
+        Excel (.xlsx/.xlsm/.xls) comes back as rows of cell values from one
+        sheet (first row is usually the header), with every sheet name
+        listed; .csv/.tsv as rows; other text as text. The format is
+        detected from the content, so a misnamed file still reads. Large
+        sheets page via start_row. .pdf/.docx/images are rejected — the
+        file itself is never returned.
         """
         client = client_factory()
         if client is None:
@@ -622,11 +681,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 False,
             )
         lower = name.lower()
-        if not lower.endswith(_SPREADSHEET_EXTS + _TEXT_EXTS):
+        if lower.endswith(_SKIP_EXTS):
             return error_envelope(
                 "invalid_argument",
-                f"{name!r}: unsupported file type. Readable: "
-                f"{', '.join(_SPREADSHEET_EXTS + _TEXT_EXTS)}. Legacy .xls is not supported.",
+                f"{name!r}: only spreadsheets (.xlsx/.xls/.csv) and text files can be read.",
                 False,
             )
 
@@ -635,22 +693,29 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         except GraphError as e:
             return e.to_envelope()
 
-        if lower.endswith(_SPREADSHEET_EXTS):
-            parsed = _read_workbook(data, sheet, start_row, max_rows)
-            if isinstance(parsed, str):
-                return parsed
+        parsed: dict | str | None = None
+        if data.startswith(_ZIP_MAGIC):
+            parsed = _read_xlsx(data, sheet, start_row, max_rows)
+        elif data.startswith(_OLE_MAGIC):
+            parsed = _read_xls(data, sheet, start_row, max_rows)
+        if isinstance(parsed, str):
+            return parsed
+        if parsed is not None:
             return _dump_rows({"attachment": info, **parsed})
 
         text = _decode_text(data)
         if text is None:
             return error_envelope(
-                "invalid_argument", f"{name!r} is not valid UTF-8/UTF-16 text.", False
+                "invalid_argument",
+                f"{name!r} is neither a spreadsheet nor UTF-8/UTF-16 text.",
+                False,
             )
-        if lower.endswith((".csv", ".tsv")):
-            delimiter = "\t" if lower.endswith(".tsv") else ","
-            parsed = _read_delimited(text, delimiter, start_row, max_rows)
-            return _dump_rows({"attachment": info, **parsed})
-        content: dict = {"content": text[:_MAX_TEXT_CHARS]}
+        delimiter = _delimiter(lower, text)
+        if delimiter is not None:
+            rows = csv.reader(io.StringIO(text), delimiter=delimiter)
+            page = _page_rows(rows, start_row, max_rows)
+            return _dump_rows({"attachment": info, "format": "csv", **page})
+        content: dict = {"format": "text", "content": text[:_MAX_TEXT_CHARS]}
         if len(text) > _MAX_TEXT_CHARS:
             content.update(truncated=True, original_length=len(text))
         return dump_json_capped({"attachment": info, **content})
