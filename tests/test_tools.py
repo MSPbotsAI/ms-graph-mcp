@@ -1102,6 +1102,71 @@ async def test_update_user_keeps_full_iso_hire_date():
 
 
 @pytest.mark.asyncio
+async def test_update_user_writes_employee_id():
+    """PRD-20321 / AC1: graph_update_user(employee_id=...) must PATCH employeeId."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_update_user", {"user_id": "u1", "employee_id": "E12345"})
+
+    assert client.methods == ["PATCH"]
+    assert client.bodies[0] == {"employeeId": "E12345"}
+
+
+@pytest.mark.asyncio
+async def test_update_user_clears_employee_id():
+    """PRD-20321 / AC2: clear_employee_id=True must PATCH employeeId to null,
+    not merely omit it (omitting it would leave the existing value untouched)."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_update_user", {"user_id": "u1", "clear_employee_id": True})
+
+    assert client.methods == ["PATCH"]
+    assert client.bodies[0] == {"employeeId": None}
+
+
+@pytest.mark.asyncio
+async def test_update_user_rejects_employee_id_and_clear_together():
+    """PRD-20321 / AC3: passing both is ambiguous -- must error before calling Graph."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    result = await mcp.call_tool(
+        "graph_update_user",
+        {"user_id": "u1", "employee_id": "E12345", "clear_employee_id": True},
+    )
+
+    assert client.calls == []
+    assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_get_user_returns_given_name_and_surname():
+    """PRD-20321 / AC4: givenName/surname (and employeeId, AC1/AC2's read side)
+    must be requested from Graph and passed through, confirming the gap was
+    connector-side ($select never asked for them), not account-data-side."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    client._result = {
+        "id": "u1",
+        "givenName": "Alice",
+        "surname": "Smith",
+        "employeeId": "E12345",
+    }
+    result = json.loads((await mcp.call_tool("graph_get_user", {"user_id": "u1"}))[0][0].text)
+
+    assert result["givenName"] == "Alice"
+    assert result["surname"] == "Smith"
+    assert result["employeeId"] == "E12345"
+    select = client.calls[0][1]["$select"]
+    assert "givenName" in select
+    assert "surname" in select
+    assert "employeeId" in select
+
+
+@pytest.mark.asyncio
 async def test_list_domains_filters_unverified_by_default():
     from graph_mcp.tools import domains
 
