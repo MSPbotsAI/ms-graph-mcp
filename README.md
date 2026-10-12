@@ -68,9 +68,9 @@ Connect your MCP client with:
 |---|---|---|
 | `graph_check_user_exists` | 按 UPN 或邮箱查询 Entra ID 用户是否存在 | `User.Read.All` |
 | `graph_list_users` | 列出/按显示名搜索 Entra ID 用户（前缀匹配，`exact=True` 改精确匹配），可按 `account_enabled` 过滤启用/禁用账号；默认返回 50 条、硬顶 200 条，分页走 `@odata.nextLink`，返回带 `has_more`。补的是「只知道名字片段、不知道准确 UPN」这个场景——`graph_check_user_exists` 要求准确 UPN/邮箱，答不了「有没有个叫 Alice 的」 | `User.Read.All` |
-| `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可 | `User.ReadWrite.All` |
+| `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可；可一并写入办公地点、电话（`business_phones`/`mobile_phone`）、地址（`street_address`/`city`/`state`/`postal_code`）、`company_name`、`employee_hire_date`（PRD-20219） | `User.ReadWrite.All` |
 | `graph_get_user` | 读取用户完整资料，含 manager、已分配许可、以及每条许可的 `licenseAssignmentStates`（`assignedByGroup` 为 null=直接分配 / 非null=组分配继承） | `User.Read.All` |
-| `graph_update_user` | 更新用户属性（仅传入的字段会改动）；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
+| `graph_update_user` | 更新用户属性（仅传入的字段会改动），含地址、公司名、入职日期；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
 | `graph_reset_password` | 管理员重置用户密码，下次登录强制改密 | `User.ReadWrite.All` + Password/User Administrator 角色 |
 | `graph_revoke_sessions` | 注销用户所有登录会话，强制重新登录 | `User.ReadWrite.All` |
 | `graph_assign_manager` | 设置用户的 manager | `User.ReadWrite.All` |
@@ -79,9 +79,12 @@ Connect your MCP client with:
 | `graph_remove_group_member` | 将用户移出一个或多个组，不在组内则幂等跳过 | `GroupMember.ReadWrite.All` |
 | `graph_list_user_groups` | 列出用户直接所属的组 | `GroupMember.Read.All`（注意：`GroupMember.ReadWrite.All` 不在该端点的受理列表里，必须单独申请 Read 版） |
 | `graph_list_groups` | 按显示名搜索/列出 Entra ID 组 | `Group.Read.All` |
+| `graph_get_group` | 按 id 读单个组的详情（类型、动态规则、是否本地同步），分配组前核对模板用户的组 id 是否还在 | `Group.Read.All` |
 | `graph_list_owned_groups` | 列出用户拥有的组，每个组附带总owner数——离职场景判断"这个用户是不是唯一owner"（`owner_count==1` 代表移除后立刻变孤儿组）。实现上先用 `/users/{id}` 把 user_id 解析成真实GUID，再全量分页拉 `/groups`、逐组调 `/groups/{id}/owners` 核对是否包含该用户——N+1，但这是目前唯一经真实租户验证可靠的路径：`/users/{id}/ownedObjects` 文档写明不支持app-only；`/groups?$filter=owners/any(...)` 会被Graph直接拒绝（`owners`不是Group上的可filter属性）；`/groups/delta` 选 `owners` 看似是文档记录的正解，但真实测试发现其分页有bug（同一批~200个组反复重复返回、`@odata.nextLink`根本没推进，与是否select owners无关），已放弃 | `Group.Read.All`（还需要 `User.Read.All` 解析user_id，已被现有`User.ReadWrite.All`覆盖） |
 | `graph_check_license_stock` | 查询租户已订阅 SKU 的许可库存与剩余数量 | `Organization.Read.All` |
 | `graph_assign_license` | 为用户分配和/或移除指定 SKU 许可（Graph 的 assignLicense 接口一次调用同时支持增删，两者合并进这一个 tool） | `User.ReadWrite.All` |
+| `graph_reprocess_license` | 对用户重跑组许可分配（`licenseAssignmentStates` 报错/卡住时用，例如补了 usage_location 或腾出库存之后），不改变应有的许可 | `User.ReadWrite.All`（最小权限 `LicenseAssignment.ReadWrite.All`） |
+| `graph_list_domains` | 列出租户域名（默认只回已验证的，`isDefault` 标出默认域），入职时选 UPN / 邮箱域 | `Domain.Read.All` 或 `Directory.Read.All`（委派版已申请 `Directory.Read.All`；app-only 需客户另授） |
 | `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC、HTML 正文及内联附件（base64，≤500 KB/文件，合计 ≤700 KB，最多 5 个） | `Mail.Send`；带 `sender_id`（代他人/共享邮箱发信）另需 `Mail.Send.Shared` |
 | `graph_list_messages` | 列出/搜索某个邮箱的邮件，只回元数据 + `bodyPreview`，不带正文；默认收件箱、按收件时间倒序，可按发件人/会话/时间窗/未读/有无附件过滤，也可 `search` 全文检索。`folder=null` 跨全部文件夹，配合 `conversation_id` 才能看到整条线程（含自己发出去的回复）。只取第一页，返回带 `has_more` | `Mail.Read`（读别人的邮箱：app-only 权限，或委派下该邮箱已共享给调用者，见 `Mail.Read.Shared`） |
 | `graph_get_message` | 读单封邮件全文（含正文）。默认让 Exchange 把正文压成纯文本（`Prefer: outlook.body-content-type`），比 HTML 省好几倍 token；正文超过 15,000 字符会截断并标 `truncated`/`original_length`。`include_attachments=true` 另跑一次附件列表，只回名称/类型/大小，**绝不回 `contentBytes`** | `Mail.Read`（同上） |
@@ -125,8 +128,9 @@ Connect your MCP client with:
 
 Onboarding:
 ```
+0. graph_list_domains        → 选邮箱 / UPN 域（可选）
 1. graph_check_user_exists   → 查重，确认账号不存在
-2. graph_create_user         → 建号并设置 usage_location
+2. graph_create_user         → 建号并设置 usage_location，地址/电话/公司/入职日期可一次写入
 3. graph_assign_groups       → 分配组
 4. graph_check_license_stock → 检查许可库存
 5. graph_assign_license      → 配许可
@@ -153,6 +157,8 @@ Scheduling（排会）：
 ```
 
 ## Known Gaps
+
+- `employee_hire_date`：Graph 要求完整 date-time，工具会把 `YYYY-MM-DD` 补成当天 `T00:00:00Z`；按 Graph 文档，app-only 权限不能写这个字段（ms-graph-app 连接会失败，委派的 ms-graph 可以）。PRD-20219 新增的参数和三个工具尚未在真实租户上验证。
 
 - `graph_remove_group_member`、`graph_revoke_sessions`、`graph_update_user` 的 `account_enabled` 参数、`graph_assign_license` 的 `remove_sku_ids` 参数都是新加的，尚未随真实 Graph 租户测试过——上线前建议先用一个可牺牲的测试账号走一遍完整离职流程再信任。
 - `graph_revoke_sessions` 不是瞬时生效：调用前已签发的 access token 在过期前仍然有效（通常 ~1 小时），所以离职场景务必同时调 `graph_update_user(account_enabled=false)`，不要只调一个。

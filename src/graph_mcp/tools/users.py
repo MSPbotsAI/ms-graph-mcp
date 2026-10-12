@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from datetime import datetime
 from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
@@ -24,6 +25,61 @@ _GRAPH_TOP_MAX = 999
 _USER_LIST_SELECT = (
     "id,displayName,userPrincipalName,mail,accountEnabled,jobTitle,department"
 )
+
+_HIRE_DATE_DESC = (
+    'Hire date, "YYYY-MM-DD" or full ISO 8601 date-time, e.g. "2026-10-20" '
+    'or "2026-10-20T00:00:00Z". Graph refuses it on app-only connections; '
+    "if the call fails on this field, retry without it."
+)
+
+
+def _normalize_hire_date(value: str) -> str | None:
+    """Graph's employeeHireDate is a DateTimeOffset and rejects a bare date
+    with a 400, so expand "YYYY-MM-DD" to midnight UTC. Returns None if the
+    value is neither shape."""
+    value = value.strip()
+    try:
+        if len(value) == 10:
+            return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00Z")
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value
+    except ValueError:
+        return None
+
+
+def _add_profile_fields(
+    body: dict,
+    *,
+    street_address: str | None,
+    city: str | None,
+    state: str | None,
+    postal_code: str | None,
+    company_name: str | None,
+    employee_hire_date: str | None,
+) -> str | None:
+    """Copy the optional address/company/hire-date fields shared by
+    graph_create_user and graph_update_user into a Graph body. Returns an
+    error envelope if employee_hire_date is malformed, else None."""
+    if street_address is not None:
+        body["streetAddress"] = street_address
+    if city is not None:
+        body["city"] = city
+    if state is not None:
+        body["state"] = state
+    if postal_code is not None:
+        body["postalCode"] = postal_code
+    if company_name is not None:
+        body["companyName"] = company_name
+    if employee_hire_date is not None:
+        normalized = _normalize_hire_date(employee_hire_date)
+        if normalized is None:
+            return error_envelope(
+                "invalid_argument",
+                'employee_hire_date must be "YYYY-MM-DD" or an ISO 8601 date-time.',
+                False,
+            )
+        body["employeeHireDate"] = normalized
+    return None
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -173,11 +229,23 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         surname: Annotated[str | None, Field(description="Last name.")] = None,
         job_title: Annotated[str | None, Field(description="Job title.")] = None,
         department: Annotated[str | None, Field(description="Department name.")] = None,
+        office_location: Annotated[str | None, Field(description="Office location.")] = None,
+        business_phones: Annotated[
+            list[str] | None, Field(description="Business phone numbers (Graph keeps one).")
+        ] = None,
+        mobile_phone: Annotated[str | None, Field(description="Mobile/cellphone number.")] = None,
+        street_address: Annotated[str | None, Field(description="Street address.")] = None,
+        city: Annotated[str | None, Field(description="City.")] = None,
+        state: Annotated[str | None, Field(description="State or province.")] = None,
+        postal_code: Annotated[str | None, Field(description="Postal / ZIP code.")] = None,
+        company_name: Annotated[str | None, Field(description="Company name.")] = None,
+        employee_hire_date: Annotated[str | None, Field(description=_HIRE_DATE_DESC)] = None,
     ) -> str:
         """Create a new Entra ID user account.
 
         usage_location is required because it must be set before any license
-        can be assigned to the user.
+        can be assigned to the user. Address, phone, company and hire date
+        can be set in the same call.
         """
         client = client_factory()
         if client is None:
@@ -202,6 +270,23 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             body["jobTitle"] = job_title
         if department is not None:
             body["department"] = department
+        if office_location is not None:
+            body["officeLocation"] = office_location
+        if business_phones is not None:
+            body["businessPhones"] = business_phones
+        if mobile_phone is not None:
+            body["mobilePhone"] = mobile_phone
+        bad = _add_profile_fields(
+            body,
+            street_address=street_address,
+            city=city,
+            state=state,
+            postal_code=postal_code,
+            company_name=company_name,
+            employee_hire_date=employee_hire_date,
+        )
+        if bad:
+            return bad
 
         try:
             result = await client.post("/users", body)
@@ -291,7 +376,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                     "$select": (
                         "id,displayName,userPrincipalName,mail,accountEnabled,"
                         "usageLocation,jobTitle,department,mobilePhone,businessPhones,"
-                        "officeLocation,provisionedPlans,assignedLicenses,"
+                        "officeLocation,streetAddress,city,state,postalCode,"
+                        "companyName,employeeHireDate,"
+                        "provisionedPlans,assignedLicenses,"
                         "licenseAssignmentStates"
                     ),
                     "$expand": "manager($select=id,displayName,userPrincipalName)",
@@ -329,6 +416,12 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         job_title: Annotated[str | None, Field(description="Job title.")] = None,
         department: Annotated[str | None, Field(description="Department name.")] = None,
         office_location: Annotated[str | None, Field(description="Office location.")] = None,
+        street_address: Annotated[str | None, Field(description="Street address.")] = None,
+        city: Annotated[str | None, Field(description="City.")] = None,
+        state: Annotated[str | None, Field(description="State or province.")] = None,
+        postal_code: Annotated[str | None, Field(description="Postal / ZIP code.")] = None,
+        company_name: Annotated[str | None, Field(description="Company name.")] = None,
+        employee_hire_date: Annotated[str | None, Field(description=_HIRE_DATE_DESC)] = None,
     ) -> str:
         """Update attributes on an existing Entra ID user.
 
@@ -355,6 +448,17 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             body["department"] = department
         if office_location is not None:
             body["officeLocation"] = office_location
+        bad = _add_profile_fields(
+            body,
+            street_address=street_address,
+            city=city,
+            state=state,
+            postal_code=postal_code,
+            company_name=company_name,
+            employee_hire_date=employee_hire_date,
+        )
+        if bad:
+            return bad
 
         if not body:
             return error_envelope("invalid_argument", "Provide at least one attribute to update.", False)

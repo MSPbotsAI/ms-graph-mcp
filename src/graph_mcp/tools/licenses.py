@@ -117,3 +117,25 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             return dump_json_capped(result)
         except GraphError as e:
             return e.to_envelope()
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
+    )
+    async def graph_reprocess_license(
+        user_id: Annotated[str, Field(description="Object ID or UPN of the user.")],
+    ) -> str:
+        """Re-run group-based license assignment for a user.
+
+        Use when graph_get_user shows licenseAssignmentStates in an error or
+        pending state (e.g. after fixing usage_location or freeing stock).
+        Does not change which licenses the user should have.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        try:
+            await client.post(f"/users/{user_id}/reprocessLicenseAssignment")
+            return dump_json_capped({"status": "success", "user_id": user_id})
+        except GraphError as e:
+            return e.to_envelope()

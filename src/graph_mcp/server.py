@@ -76,14 +76,14 @@ def create_mcp_server(settings: Settings) -> FastMCP:
     mcp = FastMCP(
         name="graph-mcp",
         instructions=(
-            "Microsoft Graph is Microsoft's unified API for Entra ID (Azure AD) and "
-            "Microsoft 365 data. It exposes 7 tool domains modeling "
+            "Microsoft Graph is the API for Entra ID and "
+            "Microsoft 365 data. It exposes 8 tool domains modeling "
             "the identity lifecycle in a tenant: users (search the directory, "
             "create/read/update accounts, "
             "reset passwords, list MFA methods, assign managers, revoke sessions), "
             "groups (search/list groups, manage a user's memberships and owned "
             "groups), licenses (check tenant SKU stock and assign/remove SKUs on a "
-            "user — usage_location must be set first), mail (triage a mailbox with "
+            "user — usage_location must be set first), domains, mail (triage a mailbox with "
             "graph_list_messages -> graph_get_message, and send as the signed-in "
             "user), sites (read/write SharePoint "
             "document libraries: graph_search_sites -> graph_list_drive_items -> "
@@ -91,7 +91,8 @@ def create_mcp_server(settings: Settings) -> FastMCP:
             "larger/binary), devices (list/remove a user's Intune-enrolled "
             "devices — needs an Intune license), and calendar (list events "
             "in a time window, check free/busy, create and cancel events). "
-            "Typical onboarding: graph_check_user_exists -> graph_create_user -> "
+            "Typical onboarding: graph_list_domains -> graph_check_user_exists "
+            "-> graph_create_user -> "
             "graph_assign_groups -> graph_check_license_stock -> "
             "graph_assign_license -> graph_send_mail. Typical offboarding: "
             "graph_update_user(account_enabled=false) -> graph_revoke_sessions -> "
@@ -110,7 +111,7 @@ def create_mcp_server(settings: Settings) -> FastMCP:
 
     client_factory: Callable[[], GraphClient | None] = lambda: get_client_from_context(settings)
 
-    from .tools import calendar, devices, groups, licenses, mail, sites, users
+    from .tools import calendar, devices, domains, groups, licenses, mail, sites, users
 
     users.register(mcp, client_factory)
     groups.register(mcp, client_factory)
@@ -118,6 +119,7 @@ def create_mcp_server(settings: Settings) -> FastMCP:
     mail.register(mcp, client_factory)
     sites.register(mcp, client_factory)
     devices.register(mcp, client_factory)
+    domains.register(mcp, client_factory)
     calendar.register(mcp, client_factory)
 
     return mcp

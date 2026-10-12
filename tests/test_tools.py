@@ -34,8 +34,11 @@ EXPECTED_TOOLS = {
     "graph_list_groups": set(),
     "graph_remove_group_member": {"user_id", "group_ids"},
     "graph_list_owned_groups": {"user_id"},
+    "graph_get_group": {"group_id"},
     "graph_check_license_stock": set(),
     "graph_assign_license": {"user_id"},
+    "graph_reprocess_license": {"user_id"},
+    "graph_list_domains": set(),
     "graph_send_mail": {"to_recipients", "subject", "body"},
     "graph_list_messages": set(),
     "graph_get_message": {"message_id"},
@@ -65,6 +68,7 @@ _NON_READ_ONLY = {
     "graph_assign_groups",
     "graph_remove_group_member",
     "graph_assign_license",
+    "graph_reprocess_license",
     "graph_send_mail",
     "graph_write_file_text",
     "graph_create_file_text",
@@ -101,7 +105,12 @@ async def test_tools_list_snapshot():
     # could not open one, so a spreadsheet emailed in was a dead end. It stays
     # separate from graph_get_message because it returns file content, not a
     # message, and pages by row.
-    assert len(names) <= 33, "tool count should stay within SOP's <=20 guideline (+13 justified)"
+    # +3 for the W2 onboarding gap list (PRD-20219): graph_list_domains (pick
+    # the UPN domain), graph_get_group (verify a template user's group id
+    # before assigning it) and graph_reprocess_license (unstick a failed
+    # group-based license). Each is a distinct endpoint none of the existing
+    # tools can reach without a mode flag.
+    assert len(names) <= 36, "tool count should stay within SOP's <=20 guideline (+16 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -175,6 +184,12 @@ class _CapturingClient:
         self.calls.append((path, {}))
         self.bodies.append(body or {})
         self.headers.append(extra_headers or {})
+        return self._result
+
+    async def patch(self, path: str, body: dict | None = None) -> dict:
+        self.methods.append("PATCH")
+        self.calls.append((path, {}))
+        self.bodies.append(body or {})
         return self._result
 
     async def delete(self, path: str) -> dict:
@@ -977,3 +992,152 @@ async def test_read_attachment_rejects_ole_file_that_is_not_xls():
     ole_garbage = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 600
     payload, _ = await _read_attachment(_file_meta("x.xls"), ole_garbage)
     assert payload["error"]["code"] == "invalid_argument"
+
+
+# --- PRD-20219: W2 onboarding gaps -------------------------------------------
+
+_PROFILE_ARGS = {
+    "office_location": "HQ 3F",
+    "business_phones": ["+1 555 0100"],
+    "mobile_phone": "+1 555 0199",
+    "street_address": "1 Main St",
+    "city": "Springfield",
+    "state": "IL",
+    "postal_code": "62701",
+    "company_name": "Acme",
+    "employee_hire_date": "2026-10-20",
+}
+
+_BASE_CREATE_ARGS = {
+    "display_name": "Alice Smith",
+    "user_principal_name": "alice@contoso.com",
+    "mail_nickname": "alice",
+    "password": "Tmp-Pa55word!",
+    "usage_location": "US",
+}
+
+
+@pytest.mark.asyncio
+async def test_create_user_sends_address_phone_company_and_hire_date():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_create_user", {**_BASE_CREATE_ARGS, **_PROFILE_ARGS})
+
+    assert client.calls[0][0] == "/users"
+    body = client.bodies[0]
+    assert body["officeLocation"] == "HQ 3F"
+    assert body["businessPhones"] == ["+1 555 0100"]
+    assert body["mobilePhone"] == "+1 555 0199"
+    assert body["streetAddress"] == "1 Main St"
+    assert body["city"] == "Springfield"
+    assert body["state"] == "IL"
+    assert body["postalCode"] == "62701"
+    assert body["companyName"] == "Acme"
+    # Graph rejects a bare date for this DateTimeOffset field.
+    assert body["employeeHireDate"] == "2026-10-20T00:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_create_user_without_new_fields_keeps_prior_body_shape():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_create_user", _BASE_CREATE_ARGS)
+
+    assert set(client.bodies[0]) == {
+        "displayName",
+        "userPrincipalName",
+        "mailNickname",
+        "accountEnabled",
+        "usageLocation",
+        "passwordProfile",
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_user_rejects_malformed_hire_date_without_calling_graph():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    result = await mcp.call_tool(
+        "graph_create_user", {**_BASE_CREATE_ARGS, "employee_hire_date": "20/10/2026"}
+    )
+
+    assert client.calls == []
+    assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_update_user_patches_only_the_given_profile_field():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_update_user", {"user_id": "u1", "street_address": "2 Elm St"})
+
+    assert client.methods == ["PATCH"]
+    assert client.calls[0][0] == "/users/u1"
+    assert client.bodies[0] == {"streetAddress": "2 Elm St"}
+
+
+@pytest.mark.asyncio
+async def test_update_user_keeps_full_iso_hire_date():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool(
+        "graph_update_user",
+        {"user_id": "u1", "employee_hire_date": "2026-10-20T09:00:00+08:00", "company_name": "Acme"},
+    )
+
+    assert client.bodies[0] == {
+        "employeeHireDate": "2026-10-20T09:00:00+08:00",
+        "companyName": "Acme",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_domains_filters_unverified_by_default():
+    from graph_mcp.tools import domains
+
+    mcp, client = _register(domains)
+    client._result = {
+        "value": [
+            {"id": "contoso.com", "isDefault": True, "isVerified": True},
+            {"id": "pending.example", "isDefault": False, "isVerified": False},
+        ]
+    }
+    result = json.loads((await mcp.call_tool("graph_list_domains", {}))[0][0].text)
+    assert client.calls[0][0] == "/domains"
+    assert [d["id"] for d in result["domains"]] == ["contoso.com"]
+
+    result = json.loads(
+        (await mcp.call_tool("graph_list_domains", {"verified_only": False}))[0][0].text
+    )
+    assert result["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_group_reads_by_id():
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    await mcp.call_tool("graph_get_group", {"group_id": "00000000-0000-0000-0000-000000000000"})
+
+    assert client.methods == ["GET"]
+    assert client.calls[0][0] == "/groups/00000000-0000-0000-0000-000000000000"
+
+
+@pytest.mark.asyncio
+async def test_reprocess_license_posts_without_body():
+    from graph_mcp.tools import licenses
+
+    mcp, client = _register(licenses)
+    result = json.loads(
+        (await mcp.call_tool("graph_reprocess_license", {"user_id": "u1"}))[0][0].text
+    )
+
+    assert client.methods == ["POST"]
+    assert client.calls[0][0] == "/users/u1/reprocessLicenseAssignment"
+    assert client.bodies[0] == {}
+    assert result == {"status": "success", "user_id": "u1"}

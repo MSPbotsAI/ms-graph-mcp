@@ -286,3 +286,30 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                     )
 
         return dump_json_capped({"user_id": user_id, "results": results})
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_get_group(
+        group_id: Annotated[str, Field(description="Group object id (GUID).")],
+    ) -> str:
+        """Read one Entra ID group's details by id.
+
+        Use to confirm a group id (e.g. one copied from a template user)
+        still exists and is the expected type before graph_assign_groups.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        try:
+            result = await client.get(
+                f"/groups/{group_id}",
+                params={
+                    "$select": (
+                        "id,displayName,description,mail,groupTypes,securityEnabled,"
+                        "mailEnabled,membershipRule,onPremisesSyncEnabled"
+                    )
+                },
+            )
+            return dump_json_capped(result)
+        except GraphError as e:
+            return e.to_envelope()
