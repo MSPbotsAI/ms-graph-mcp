@@ -29,7 +29,7 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         try:
             result = await client.get(
                 "/domains",
-                params={"$select": "id,isDefault,isInitial,isVerified,authenticationType"},
+                params={"$select": "id,isDefault,isInitial,isVerified,isAdminManaged,authenticationType"},
             )
             domains = result.get("value", []) if isinstance(result, dict) else []
             if verified_only:

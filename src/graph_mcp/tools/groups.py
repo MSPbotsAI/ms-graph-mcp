@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from urllib.parse import parse_qs, urlsplit
 from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
@@ -22,6 +23,16 @@ _GRAPH_TOP_MAX = 999
 # walk (at $top=999/page this covers ~50k groups) — a runaway pagination
 # loop should stop rather than hang the request indefinitely.
 _MAX_GROUP_LIST_PAGES = 50
+
+
+def _skiptoken(next_link: str | None) -> str | None:
+    """Pull $skiptoken out of an @odata.nextLink. Only the token goes back to
+    the caller — never the full URL — so a page_token can't point the client
+    (and its bearer token) at another host."""
+    if not next_link:
+        return None
+    values = parse_qs(urlsplit(next_link).query).get("$skiptoken")
+    return values[0] if values else None
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -291,10 +302,11 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     async def graph_get_group(
         group_id: Annotated[str, Field(description="Group object id (GUID).")],
     ) -> str:
-        """Read one Entra ID group's details by id.
+        """Read one Entra ID group's details by id, incl. mail-enabled and sync source.
 
-        Use to confirm a group id (e.g. one copied from a template user)
-        still exists and is the expected type before graph_assign_groups.
+        sync_source is "on-premises" for AD-synced groups (membership must be
+        changed in on-prem AD) or "cloud". Use to confirm a group id still
+        exists and is the expected type before graph_assign_groups.
         """
         client = client_factory()
         if client is None:
@@ -305,11 +317,64 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 f"/groups/{group_id}",
                 params={
                     "$select": (
-                        "id,displayName,description,mail,groupTypes,securityEnabled,"
-                        "mailEnabled,membershipRule,onPremisesSyncEnabled"
+                        "id,displayName,description,mail,mailNickname,groupTypes,"
+                        "securityEnabled,mailEnabled,visibility,membershipRule,"
+                        "onPremisesSyncEnabled,onPremisesLastSyncDateTime"
                     )
                 },
             )
+            if isinstance(result, dict):
+                result["sync_source"] = (
+                    "on-premises" if result.get("onPremisesSyncEnabled") else "cloud"
+                )
             return dump_json_capped(result)
+        except GraphError as e:
+            return e.to_envelope()
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_list_group_members(
+        group_id: Annotated[str, Field(description="Group object id (GUID).")],
+        max_results: Annotated[
+            int, Field(description="Max members per page (default 50, hard cap 200).")
+        ] = _DEFAULT_MAX_RESULTS,
+        page_token: Annotated[
+            str | None,
+            Field(description="next_page_token from the previous page; omit for the first page."),
+        ] = None,
+    ) -> str:
+        """List a group's direct members, one page at a time.
+
+        Members can be users, nested groups, devices or service principals
+        (see member_type). When has_more is true, call again with
+        next_page_token to get the next page.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        max_results = max(1, min(max_results, _HARD_CAP_MAX_RESULTS))
+        params: dict = {
+            "$select": "id,displayName,userPrincipalName,mail,accountEnabled",
+            "$top": str(max_results),
+        }
+        if page_token:
+            params["$skiptoken"] = page_token
+
+        try:
+            result = await client.get(f"/groups/{group_id}/members", params=params)
+            members = []
+            for m in result.get("value", [])[:max_results]:
+                odata_type = m.pop("@odata.type", "") or ""
+                members.append({**m, "member_type": odata_type.removeprefix("#microsoft.graph.")})
+            next_token = _skiptoken(result.get("@odata.nextLink"))
+            return dump_json_capped(
+                {
+                    "group_id": group_id,
+                    "count": len(members),
+                    "members": members,
+                    "has_more": next_token is not None,
+                    "next_page_token": next_token,
+                }
+            )
         except GraphError as e:
             return e.to_envelope()

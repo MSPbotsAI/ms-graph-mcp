@@ -66,7 +66,7 @@ Connect your MCP client with:
 
 | Tool | 功能 | Required Scope |
 |---|---|---|
-| `graph_check_user_exists` | 按 UPN 或邮箱查询 Entra ID 用户是否存在 | `User.Read.All` |
+| `graph_check_user_exists` | 按 UPN、邮箱或任一 proxy address（含别名，裸地址按 `smtp:` 匹配）查询 Entra ID 用户是否存在；proxy address 走 Graph 高级查询（`ConsistencyLevel: eventual` + `$count`）（PRD-20223） | `User.Read.All` |
 | `graph_list_users` | 列出/按显示名搜索 Entra ID 用户（前缀匹配，`exact=True` 改精确匹配），可按 `account_enabled` 过滤启用/禁用账号；默认返回 50 条、硬顶 200 条，分页走 `@odata.nextLink`，返回带 `has_more`。补的是「只知道名字片段、不知道准确 UPN」这个场景——`graph_check_user_exists` 要求准确 UPN/邮箱，答不了「有没有个叫 Alice 的」 | `User.Read.All` |
 | `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可；可一并写入办公地点、电话（`business_phones`/`mobile_phone`）、地址（`street_address`/`city`/`state`/`postal_code`）、`company_name`、`employee_hire_date`（PRD-20219） | `User.ReadWrite.All` |
 | `graph_get_user` | 读取用户完整资料，含 manager、已分配许可、以及每条许可的 `licenseAssignmentStates`（`assignedByGroup` 为 null=直接分配 / 非null=组分配继承） | `User.Read.All` |
@@ -79,7 +79,8 @@ Connect your MCP client with:
 | `graph_remove_group_member` | 将用户移出一个或多个组，不在组内则幂等跳过 | `GroupMember.ReadWrite.All` |
 | `graph_list_user_groups` | 列出用户直接所属的组 | `GroupMember.Read.All`（注意：`GroupMember.ReadWrite.All` 不在该端点的受理列表里，必须单独申请 Read 版） |
 | `graph_list_groups` | 按显示名搜索/列出 Entra ID 组 | `Group.Read.All` |
-| `graph_get_group` | 按 id 读单个组的详情（类型、动态规则、是否本地同步），分配组前核对模板用户的组 id 是否还在 | `Group.Read.All` |
+| `graph_get_group` | 按 id 读单个组的详情：是否启用邮件、类型、动态规则，以及同步来源（派生字段 `sync_source`：`on-premises` / `cloud`，附 `onPremisesLastSyncDateTime`）。分配组前可以先用它核对模板用户的组 id 还在不在 | `Group.Read.All` |
+| `graph_list_group_members` | 分页列出组的直接成员（用户 / 嵌套组 / 设备 / 服务主体，见 `member_type`）；每页默认 50、上限 200，`has_more` 为真时带 `next_page_token` 取下一页，只回 `$skiptoken` 不回完整 URL（PRD-20223） | `GroupMember.Read.All` |
 | `graph_list_owned_groups` | 列出用户拥有的组，每个组附带总owner数——离职场景判断"这个用户是不是唯一owner"（`owner_count==1` 代表移除后立刻变孤儿组）。实现上先用 `/users/{id}` 把 user_id 解析成真实GUID，再全量分页拉 `/groups`、逐组调 `/groups/{id}/owners` 核对是否包含该用户——N+1，但这是目前唯一经真实租户验证可靠的路径：`/users/{id}/ownedObjects` 文档写明不支持app-only；`/groups?$filter=owners/any(...)` 会被Graph直接拒绝（`owners`不是Group上的可filter属性）；`/groups/delta` 选 `owners` 看似是文档记录的正解，但真实测试发现其分页有bug（同一批~200个组反复重复返回、`@odata.nextLink`根本没推进，与是否select owners无关），已放弃 | `Group.Read.All`（还需要 `User.Read.All` 解析user_id，已被现有`User.ReadWrite.All`覆盖） |
 | `graph_check_license_stock` | 查询租户已订阅 SKU 的许可库存与剩余数量 | `Organization.Read.All` |
 | `graph_assign_license` | 为用户分配和/或移除指定 SKU 许可（Graph 的 assignLicense 接口一次调用同时支持增删，两者合并进这一个 tool） | `User.ReadWrite.All` |
@@ -159,6 +160,7 @@ Scheduling（排会）：
 ## Known Gaps
 
 - `employee_hire_date`：Graph 要求完整 date-time，工具会把 `YYYY-MM-DD` 补成当天 `T00:00:00Z`；按 Graph 文档，app-only 权限不能写这个字段（ms-graph-app 连接会失败，委派的 ms-graph 可以）。PRD-20219 新增的参数和三个工具尚未在真实租户上验证。
+- PRD-20223：proxy address 查询依赖 Graph 高级查询，`graph_list_group_members` 翻页靠手工拼 `$skiptoken`，两者都需要在真实租户上验证。
 
 - `graph_remove_group_member`、`graph_revoke_sessions`、`graph_update_user` 的 `account_enabled` 参数、`graph_assign_license` 的 `remove_sku_ids` 参数都是新加的，尚未随真实 Graph 租户测试过——上线前建议先用一个可牺牲的测试账号走一遍完整离职流程再信任。
 - `graph_revoke_sessions` 不是瞬时生效：调用前已签发的 access token 在过期前仍然有效（通常 ~1 小时），所以离职场景务必同时调 `graph_update_user(account_enabled=false)`，不要只调一个。

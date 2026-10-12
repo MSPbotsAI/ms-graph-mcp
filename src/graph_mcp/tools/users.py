@@ -92,34 +92,54 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         mail: Annotated[
             str | None, Field(description="Primary SMTP address to search for.")
         ] = None,
+        proxy_address: Annotated[
+            str | None,
+            Field(
+                description=(
+                    'Any address on the user, incl. aliases, e.g. "alice@contoso.com" '
+                    'or "smtp:alice@contoso.com". A bare address is matched as smtp:.'
+                )
+            ),
+        ] = None,
     ) -> str:
-        """Check whether an Entra ID user exists by UPN or mail address.
+        """Check whether an Entra ID user exists by UPN, mail or any proxy address.
 
-        Exactly one of user_principal_name or mail must be provided. Returns
+        Provide exactly one of user_principal_name, mail or proxy_address.
+        proxy_address also matches secondary aliases, so use it to check that
+        an address is free before creating a user. Returns
         {"exists": true/false, "user": object | null}.
         """
         client = client_factory()
         if client is None:
             return NO_TOKEN
-        if not user_principal_name and not mail:
+        given = [v for v in (user_principal_name, mail, proxy_address) if v]
+        if len(given) != 1:
             return error_envelope(
-                "invalid_argument", "Provide either user_principal_name or mail.", False
+                "invalid_argument",
+                "Provide exactly one of user_principal_name, mail or proxy_address.",
+                False,
             )
 
+        params: dict = {
+            "$select": "id,displayName,userPrincipalName,mail,accountEnabled,proxyAddresses",
+            "$top": "1",
+        }
+        extra_headers = None
         if user_principal_name:
-            filter_expr = f"userPrincipalName eq '{odata_quote(user_principal_name)}'"
+            params["$filter"] = f"userPrincipalName eq '{odata_quote(user_principal_name)}'"
+        elif mail:
+            params["$filter"] = f"mail eq '{odata_quote(mail)}'"
         else:
-            filter_expr = f"mail eq '{odata_quote(mail)}'"
+            address = proxy_address.strip()
+            if ":" not in address:
+                address = f"smtp:{address}"
+            # Lambda filters on proxyAddresses are an advanced directory query.
+            params["$filter"] = f"proxyAddresses/any(x:x eq '{odata_quote(address)}')"
+            params["$count"] = "true"
+            extra_headers = {"ConsistencyLevel": "eventual"}
 
         try:
-            result = await client.get(
-                "/users",
-                params={
-                    "$filter": filter_expr,
-                    "$select": "id,displayName,userPrincipalName,mail,accountEnabled",
-                    "$top": "1",
-                },
-            )
+            result = await client.get("/users", params=params, extra_headers=extra_headers)
             users = result.get("value", [])
             if users:
                 return dump_json_capped({"exists": True, "user": users[0]})

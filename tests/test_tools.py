@@ -35,6 +35,7 @@ EXPECTED_TOOLS = {
     "graph_remove_group_member": {"user_id", "group_ids"},
     "graph_list_owned_groups": {"user_id"},
     "graph_get_group": {"group_id"},
+    "graph_list_group_members": {"group_id"},
     "graph_check_license_stock": set(),
     "graph_assign_license": {"user_id"},
     "graph_reprocess_license": {"user_id"},
@@ -110,7 +111,11 @@ async def test_tools_list_snapshot():
     # before assigning it) and graph_reprocess_license (unstick a failed
     # group-based license). Each is a distinct endpoint none of the existing
     # tools can reach without a mode flag.
-    assert len(names) <= 36, "tool count should stay within SOP's <=20 guideline (+16 justified)"
+    # +1 for graph_list_group_members (PRD-20223, Ginko parity): the group
+    # tools only walked membership from the user side; nothing listed who is
+    # in a given group. proxyAddresses lookup was added as a parameter on
+    # graph_check_user_exists, not a new tool — same question, another key.
+    assert len(names) <= 37, "tool count should stay within SOP's <=20 guideline (+17 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -1141,3 +1146,120 @@ async def test_reprocess_license_posts_without_body():
     assert client.calls[0][0] == "/users/u1/reprocessLicenseAssignment"
     assert client.bodies[0] == {}
     assert result == {"status": "success", "user_id": "u1"}
+
+
+# --- PRD-20223: Ginko parity -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_user_exists_by_proxy_address_uses_advanced_query():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_check_user_exists", {"proxy_address": "o'brien@contoso.com"})
+
+    path, params = client.calls[0]
+    assert path == "/users"
+    # Bare address is matched as smtp:, apostrophe doubled for OData.
+    assert params["$filter"] == "proxyAddresses/any(x:x eq 'smtp:o''brien@contoso.com')"
+    assert params["$count"] == "true"
+    assert client.headers[0] == {"ConsistencyLevel": "eventual"}
+
+
+@pytest.mark.asyncio
+async def test_check_user_exists_keeps_explicit_proxy_prefix():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_check_user_exists", {"proxy_address": "SIP:alice@contoso.com"})
+
+    assert client.calls[0][1]["$filter"] == "proxyAddresses/any(x:x eq 'SIP:alice@contoso.com')"
+
+
+@pytest.mark.asyncio
+async def test_check_user_exists_rejects_more_than_one_key():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    result = await mcp.call_tool(
+        "graph_check_user_exists", {"mail": "a@contoso.com", "proxy_address": "a@contoso.com"}
+    )
+
+    assert client.calls == []
+    assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_check_user_exists_by_upn_has_no_advanced_query_header():
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_check_user_exists", {"user_principal_name": "a@contoso.com"})
+
+    assert client.headers[0] == {}
+    assert "$count" not in client.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_get_group_derives_sync_source():
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    client._result = {"id": "g1", "mailEnabled": True, "onPremisesSyncEnabled": True}
+    result = json.loads((await mcp.call_tool("graph_get_group", {"group_id": "g1"}))[0][0].text)
+    assert result["sync_source"] == "on-premises"
+    assert "onPremisesLastSyncDateTime" in client.calls[0][1]["$select"]
+
+    client._result = {"id": "g2", "mailEnabled": False, "onPremisesSyncEnabled": None}
+    result = json.loads((await mcp.call_tool("graph_get_group", {"group_id": "g2"}))[0][0].text)
+    assert result["sync_source"] == "cloud"
+
+
+@pytest.mark.asyncio
+async def test_list_group_members_returns_only_the_skiptoken():
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    client._result = {
+        "value": [
+            {"@odata.type": "#microsoft.graph.user", "id": "u1", "displayName": "Alice"},
+            {"@odata.type": "#microsoft.graph.group", "id": "g9", "displayName": "Nested"},
+        ],
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/groups/g1/members?$top=2&$skiptoken=ABC%2B1",
+    }
+    result = json.loads(
+        (await mcp.call_tool("graph_list_group_members", {"group_id": "g1", "max_results": 2}))[0][0].text
+    )
+
+    assert client.calls[0][0] == "/groups/g1/members"
+    assert client.calls[0][1]["$top"] == "2"
+    assert [m["member_type"] for m in result["members"]] == ["user", "group"]
+    assert result["has_more"] is True
+    assert result["next_page_token"] == "ABC+1"
+
+
+@pytest.mark.asyncio
+async def test_list_group_members_next_page_passes_skiptoken_and_caps_page():
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    client._result = {"value": []}
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_list_group_members",
+                {"group_id": "g1", "max_results": 5000, "page_token": "ABC+1"},
+            )
+        )[0][0].text
+    )
+
+    params = client.calls[0][1]
+    assert params["$skiptoken"] == "ABC+1"
+    assert params["$top"] == "200"
+    assert result == {
+        "group_id": "g1",
+        "count": 0,
+        "members": [],
+        "has_more": False,
+        "next_page_token": None,
+    }
