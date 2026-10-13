@@ -49,6 +49,7 @@ EXPECTED_TOOLS = {
     "graph_list_drive_items": {"drive_id"},
     "graph_get_file": {"drive_id", "item_id"},
     "graph_read_file_text": {"drive_id", "item_id"},
+    "graph_read_site_file_text": {"site_query", "file_name"},
     "graph_write_file_text": {"drive_id", "item_id", "content"},
     "graph_create_file_text": {"drive_id", "path", "content"},
     "graph_delete_file": {"drive_id", "item_id"},
@@ -121,7 +122,11 @@ async def test_tools_list_snapshot():
     # manager without assigning a replacement; graph_assign_manager's
     # manager_id stays required rather than becoming an optional "mode flag"
     # (see the calendar/mail notes above).
-    assert len(names) <= 38, "tool count should stay within SOP's <=20 guideline (+18 justified)"
+    # +1 for graph_read_site_file_text (PRD-20413): collapses the three-call
+    # site -> drive -> file chain into one call so the model never has to
+    # copy a driveId between calls — the id-copying is what caused the
+    # reopened PRD-20211 intermittent "malformed drive id" failure.
+    assert len(names) <= 39, "tool count should stay within SOP's <=20 guideline (+19 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -1897,3 +1902,315 @@ async def test_list_group_members_next_page_passes_skiptoken_and_caps_page():
         "has_more": False,
         "next_page_token": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# graph_read_site_file_text (PRD-20413)
+# ---------------------------------------------------------------------------
+
+
+class _SiteFileClient:
+    """GraphClient stand-in for graph_read_site_file_text's multi-step
+    resolution chain. `get` returns queued responses in call order — a dict
+    to return, or a GraphError instance to raise; `get_content` always
+    returns the fixed byte string passed at construction."""
+
+    def __init__(self, steps: list, content: bytes = b""):
+        self._steps = list(steps)
+        self.calls: list[tuple[str, dict]] = []
+        self.methods: list[str] = []
+        self.content_calls: list[str] = []
+        self._content = content
+
+    async def get(self, path: str, params: dict | None = None, extra_headers: dict | None = None):
+        self.methods.append("GET")
+        self.calls.append((path, params or {}))
+        step = self._steps.pop(0)
+        if isinstance(step, GraphError):
+            raise step
+        return step
+
+    async def get_content(self, path: str) -> bytes:
+        self.methods.append("GET")
+        self.content_calls.append(path)
+        return self._content
+
+
+def _sites_mcp(client):
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import sites
+
+    mcp = FastMCP(name="test")
+    sites.register(mcp, lambda: client)
+    return mcp
+
+
+async def _read_site_file(client, **args):
+    mcp = _sites_mcp(client)
+    full_args = {"site_query": "permission matrix", "file_name": "Permission Matrix.csv", **args}
+    _, structured = await mcp.call_tool("graph_read_site_file_text", full_args)
+    return json.loads(structured["result"])
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_happy_path_exact_site_match():
+    site_hit = {
+        "id": "site1",
+        "name": "pm",
+        "displayName": "Permission Matrix",
+        "webUrl": "https://x/sites/pm",
+    }
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {
+        "id": "item1",
+        "name": "Permission Matrix.csv",
+        "size": 38,
+        "file": {"mimeType": "text/csv"},
+        "lastModifiedDateTime": "2026-10-01T00:00:00Z",
+    }
+    client = _SiteFileClient(
+        steps=[{"value": [site_hit]}, drive, file_item],
+        content=b"Job Title,Collaboration\nEngineer,Full",
+    )
+    payload = await _read_site_file(client)
+
+    assert payload["content"] == "Job Title,Collaboration\nEngineer,Full"
+    assert payload["site"] == {
+        "id": "site1",
+        "displayName": "Permission Matrix",
+        "webUrl": "https://x/sites/pm",
+    }
+    assert payload["drive"] == {"id": "drive1", "name": "Documents"}
+    assert payload["file"]["id"] == "item1"
+    assert payload["file"]["size"] == 38
+    # The only request args the caller supplied are site_query/file_name —
+    # no driveId/item id ever appears in what produced this result.
+    assert client.calls[0][0] == "/sites"
+    assert client.calls[0][1]["search"] == "permission matrix"
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_falls_back_to_single_keyword_hit():
+    site_hit = {
+        "id": "site1",
+        "name": "pm-hub",
+        "displayName": "PM Hub",
+        "webUrl": "https://x/sites/pmhub",
+    }
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {
+        "id": "item1",
+        "name": "Permission Matrix.csv",
+        "size": 7,
+        "lastModifiedDateTime": "2026-10-01T00:00:00Z",
+    }
+    client = _SiteFileClient(steps=[{"value": [site_hit]}, drive, file_item], content=b"a,b\n1,2")
+    payload = await _read_site_file(client)
+
+    assert "error" not in payload
+    assert payload["site"]["id"] == "site1"
+    assert payload["content"] == "a,b\n1,2"
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_site_not_found_no_further_calls():
+    client = _SiteFileClient(steps=[{"value": []}])
+    payload = await _read_site_file(client)
+
+    assert payload["error"]["code"] == "site_not_found"
+    assert payload["error"]["searched_for"] == "permission matrix"
+    assert len(client.calls) == 1
+    assert client.content_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_site_ambiguous_lists_candidates():
+    hits = [
+        {"id": "s1", "displayName": "PM Alpha", "webUrl": "https://x/a"},
+        {"id": "s2", "displayName": "PM Beta", "webUrl": "https://x/b"},
+    ]
+    client = _SiteFileClient(steps=[{"value": hits}])
+    payload = await _read_site_file(client)
+
+    assert payload["error"]["code"] == "site_ambiguous"
+    assert payload["error"]["candidates"] == hits
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_site_id_skips_search():
+    site = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {
+        "id": "item1",
+        "name": "Permission Matrix.csv",
+        "size": 7,
+        "lastModifiedDateTime": "2026-10-01T00:00:00Z",
+    }
+    client = _SiteFileClient(steps=[site, drive, file_item], content=b"a,b\n1,2")
+    payload = await _read_site_file(client, site_id="site1")
+
+    assert payload["site"]["id"] == "site1"
+    assert client.calls[0][0] == "/sites/site1"
+    assert all("search" not in params for _, params in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_file_not_found_lists_folder_contents():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    client = _SiteFileClient(
+        steps=[
+            {"value": [site_hit]},
+            drive,
+            GraphError(404, "not found"),
+            {"value": [{"name": "a.csv"}, {"name": "b.csv"}]},
+        ]
+    )
+    payload = await _read_site_file(client)
+
+    assert payload["error"]["code"] == "file_not_found"
+    assert payload["error"]["files_in_folder"] == ["a.csv", "b.csv"]
+    assert client.content_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_path_is_folder_not_file():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    folder_item = {"id": "folder1", "name": "Permission Matrix.csv", "folder": {"childCount": 2}}
+    client = _SiteFileClient(steps=[{"value": [site_hit]}, drive, folder_item])
+    payload = await _read_site_file(client)
+
+    assert payload["error"]["code"] == "file_not_found"
+    assert payload["error"]["reason"] == "path is a folder, not a file"
+    assert client.content_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_no_document_library():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    client = _SiteFileClient(steps=[{"value": [site_hit]}, GraphError(404, "no drive")])
+    payload = await _read_site_file(client)
+
+    assert payload["error"]["code"] == "file_not_found"
+    assert payload["error"]["reason"] == "site has no default document library"
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_empty_file_no_content_fetch():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {
+        "id": "item1",
+        "name": "Permission Matrix.csv",
+        "size": 0,
+        "lastModifiedDateTime": "2026-10-01T00:00:00Z",
+    }
+    client = _SiteFileClient(steps=[{"value": [site_hit]}, drive, file_item])
+    payload = await _read_site_file(client)
+
+    assert payload["error"]["code"] == "file_empty"
+    assert payload["error"]["file"] == {
+        "name": "Permission Matrix.csv",
+        "lastModifiedDateTime": "2026-10-01T00:00:00Z",
+    }
+    assert client.content_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_rejects_file_over_200kb():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {"id": "item1", "name": "big.csv", "size": 200_001}
+    client = _SiteFileClient(steps=[{"value": [site_hit]}, drive, file_item])
+    payload = await _read_site_file(client, file_name="big.csv")
+
+    assert payload["error"]["code"] == "file_too_large"
+    assert payload["error"]["size"] == 200_001
+    assert payload["error"]["limit"] == 200_000
+    assert client.content_calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_allows_file_at_exactly_200kb_boundary():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {"id": "item1", "name": "exact.csv", "size": 200_000}
+    client = _SiteFileClient(steps=[{"value": [site_hit]}, drive, file_item], content=b"ok")
+    payload = await _read_site_file(client, file_name="exact.csv")
+
+    assert "error" not in payload
+    assert payload["content"] == "ok"
+    assert client.content_calls == ["/drives/drive1/items/item1/content"]
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_binary_content_returns_not_text():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {
+        "id": "item1",
+        "name": "report.xlsx",
+        "size": 10,
+        "file": {"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    }
+    client = _SiteFileClient(
+        steps=[{"value": [site_hit]}, drive, file_item], content=b"\xff\xfe\x00\x01"
+    )
+    payload = await _read_site_file(client, file_name="report.xlsx")
+
+    assert payload["error"]["code"] == "not_text"
+    assert (
+        payload["error"]["file_type"]
+        == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_no_cross_call_state_leak():
+    site_a = {"id": "site-a", "displayName": "Tenant A Site", "webUrl": "https://a/x"}
+    site_b = {"id": "site-b", "displayName": "Tenant B Site", "webUrl": "https://b/x"}
+    client_a = _SiteFileClient(
+        steps=[
+            {"value": [site_a]},
+            {"id": "drive-a", "name": "Documents"},
+            {"id": "item-a", "name": "a.csv", "size": 3},
+        ],
+        content=b"aaa",
+    )
+    client_b = _SiteFileClient(
+        steps=[
+            {"value": [site_b]},
+            {"id": "drive-b", "name": "Documents"},
+            {"id": "item-b", "name": "b.csv", "size": 3},
+        ],
+        content=b"bbb",
+    )
+
+    payload_a = await _read_site_file(client_a, site_query="Tenant A Site", file_name="a.csv")
+    payload_b = await _read_site_file(client_b, site_query="Tenant B Site", file_name="b.csv")
+
+    assert payload_a["content"] == "aaa"
+    assert payload_b["content"] == "bbb"
+    # Each tenant's own client independently issued its own full resolution
+    # chain — the second call's site-search call was actually made, not
+    # skipped by anything cached from the first call.
+    assert client_a.calls[0][0] == "/sites"
+    assert client_b.calls[0][0] == "/sites"
+    assert len(client_a.calls) == 3
+    assert len(client_b.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_read_site_file_text_only_issues_get_requests():
+    site_hit = {"id": "site1", "displayName": "Permission Matrix", "webUrl": "https://x/pm"}
+    drive = {"id": "drive1", "name": "Documents"}
+    file_item = {"id": "item1", "name": "Permission Matrix.csv", "size": 5}
+    client = _SiteFileClient(steps=[{"value": [site_hit]}, drive, file_item], content=b"hello")
+
+    await _read_site_file(client)
+
+    assert client.methods and all(m == "GET" for m in client.methods)
