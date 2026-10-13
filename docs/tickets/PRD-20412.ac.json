@@ -1,0 +1,51 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given graph_create_user is called with the minimum required parameters and Graph returns 201, When the tool returns its result to the caller, Then the JSON includes passwordChangeRequiredAtNextSignIn: true.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_create_user_response_confirms_forced_password_change"]
+  },
+  {
+    "id": "TC2",
+    "ac": "AC2",
+    "text": "Given the MCP server's registered tools are introspected, When graph_create_user's description is read, Then it explicitly states that created accounts are configured to require a password change at next sign-in and that this is not configurable per call.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_create_user_description_documents_forced_password_change"]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC3",
+    "text": "Given Graph returns an error for POST /users (e.g. a conflicting userPrincipalName), When graph_create_user returns its error envelope, Then the response does not contain passwordChangeRequiredAtNextSignIn.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_create_user_error_envelope_has_no_password_confirmation"]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC4",
+    "text": "Given graph_create_user is called with only required parameters (no optional profile fields), When the response is compared against today's response shape, Then every field present today is still present and unchanged, plus the new confirmation field.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_create_user_response_is_additive_only"]
+  },
+  {
+    "id": "TC5",
+    "ac": "AC5",
+    "text": "Given two consecutive graph_create_user calls use different tokens, passwords and display names, When both complete, Then each call's response (including the confirmation field) reflects only that call's own input, with nothing carried over from the other call.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_create_user_confirmation_is_per_call_not_shared_state"]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC6",
+    "type": "manual",
+    "text": "Given a real Entra ID tenant, When a newly created account signs in for the first time with the password graph_create_user set, Then Microsoft requires setting a new password before proceeding.",
+    "steps": [
+      "Call graph_create_user against a sandbox/live Entra ID tenant to create a throwaway test account",
+      "Using the returned password, attempt to sign in as that account at login.microsoftonline.com (or the tenant's sign-in endpoint)",
+      "Observe whether Microsoft presents a forced password-change screen before allowing access"
+    ],
+    "expect": "A 'Update your password' / forced password change screen appears before the account can proceed to any app, matching the Microsoft 365 admin center behavior shown in the ticket's attached screenshot.",
+    "result": "untested",
+    "evidence": "Not executed in the design leg: read-only code access only, no live/sandbox Entra ID tenant credentials available in this session. Left for legs/dev.md S5 self-test to attempt if a tenant is available."
+  }
+]
