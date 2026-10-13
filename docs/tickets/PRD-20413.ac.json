@@ -1,0 +1,156 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given a site whose displayName exactly (case-insensitively) matches site_query, with a small (<=200,000 byte) UTF-8 text file named file_name in its document library root, When graph_read_site_file_text(site_query, file_name) is called once, Then the response contains the file's exact content plus site/drive/file metadata, and the caller never supplied a driveId or item id",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_happy_path_exact_site_match"
+    ]
+  },
+  {
+    "id": "TC2",
+    "ac": "AC2",
+    "text": "Given no exact displayName match but exactly one keyword-search hit for site_query, When the tool is called, Then that single hit is used (no site_ambiguous) and the file is read successfully",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_falls_back_to_single_keyword_hit"
+    ]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC3",
+    "text": "Given a site_query matching no site at all, When the tool is called, Then it returns error.code = site_not_found with the search term echoed back, and makes no drive or file call",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_site_not_found_no_further_calls"
+    ]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC4",
+    "text": "Given more than one keyword-search hit for site_query and none of them an exact displayName match, When the tool is called, Then it returns error.code = site_ambiguous with a candidate list (id, displayName, webUrl) matching the search results",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_site_ambiguous_lists_candidates"
+    ]
+  },
+  {
+    "id": "TC5",
+    "ac": "AC5",
+    "text": "Given a valid site_id is passed (with or without site_query), When the tool is called, Then site resolution uses site_id directly via GET /sites/{site_id} and the capturing client never receives a /sites?search= call",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_site_id_skips_search"
+    ]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC6",
+    "text": "Given the file path 404s under a resolved drive, When the tool is called, Then it returns error.code = file_not_found with files_in_folder populated from the folder-listing call",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_file_not_found_lists_folder_contents"
+    ]
+  },
+  {
+    "id": "TC7",
+    "ac": "AC6",
+    "text": "Given the resolved path's item carries a folder facet instead of a file facet, When the tool is called, Then it returns error.code = file_not_found with a reason stating the path is a folder, not a file",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_path_is_folder_not_file"
+    ]
+  },
+  {
+    "id": "TC8",
+    "ac": "AC6",
+    "text": "Given the resolved site's /drive call 404s (no default document library), When the tool is called, Then it returns error.code = file_not_found with a reason stating there is no document library",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_no_document_library"
+    ],
+    "notes": "source: dev — follows directly from the _resolve_drive branch, not independently required by the ticket's own AC list"
+  },
+  {
+    "id": "TC9",
+    "ac": "AC7",
+    "text": "Given the resolved file's size is 0 bytes, When the tool is called, Then it returns error.code = file_empty with the file's name and lastModifiedDateTime, and the capturing client's call list contains no /content call",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_empty_file_no_content_fetch"
+    ]
+  },
+  {
+    "id": "TC10",
+    "ac": "AC8",
+    "text": "Given the resolved file's size is 200,001 bytes, When the tool is called, Then it returns error.code = file_too_large with the actual size and the 200,000-byte limit, and no /content call is made",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_rejects_file_over_200kb"
+    ]
+  },
+  {
+    "id": "TC11",
+    "ac": "AC8",
+    "text": "Given the resolved file's size is exactly 200,000 bytes (boundary), When the tool is called, Then it proceeds to fetch and return content (boundary uses > not >=)",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_allows_file_at_exactly_200kb_boundary"
+    ]
+  },
+  {
+    "id": "TC12",
+    "ac": "AC9",
+    "text": "Given the fetched content bytes fail UTF-8 decoding, When the tool is called, Then it returns error.code = not_text with the file's reported mimeType as file_type",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_binary_content_returns_not_text"
+    ]
+  },
+  {
+    "id": "TC13",
+    "ac": "AC10",
+    "text": "Given two back-to-back calls using different simulated tokens/tenants (separate _CapturingClient instances) and different site/file names, When both calls run, Then neither call's site/drive/file resolution is reused by the other — the second call independently issues its own full resolution chain including its own site-search call",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_no_cross_call_state_leak"
+    ]
+  },
+  {
+    "id": "TC14",
+    "ac": "AC10",
+    "text": "Given any successful or failing call to graph_read_site_file_text, When the call completes, Then every HTTP request recorded by the capturing client has method GET — never POST/PUT/DELETE",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_read_site_file_text_only_issues_get_requests"
+    ]
+  },
+  {
+    "id": "TC15",
+    "ac": "AC1",
+    "type": "manual",
+    "text": "The ticket's own stated acceptance bar: 10 consecutive runs against a live tenant, zero malformed-id-style errors",
+    "steps": [
+      "On a live, already-consented test tenant with a SharePoint site containing Permission Matrix.csv, run the real onboarding agent (or a scripted equivalent) calling graph_read_site_file_text(site_query=\"permission matrix\", file_name=\"Permission Matrix.csv\") 10 times back to back",
+      "Record the result of each of the 10 calls"
+    ],
+    "expect": "All 10 calls return the file's content successfully; zero calls fail with a malformed/invalid drive-id-style error",
+    "result": "untested",
+    "evidence": ""
+  },
+  {
+    "id": "TC16",
+    "ac": "AC9",
+    "type": "manual",
+    "text": "A real binary Office file triggers not_text with a sensible file_type reflecting Graph's actual MIME-type reporting (unit tests can only simulate the UTF-8 decode failure, not Graph's real mimeType value)",
+    "steps": [
+      "On a live test tenant, place a real .xlsx or .docx file at a known site/path",
+      "Call graph_read_site_file_text with that site_query/file_name/folder_path",
+      "Inspect the returned error envelope"
+    ],
+    "expect": "error.code = not_text, with file_type reflecting the real MIME type Graph reports for that file (e.g. application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)",
+    "result": "untested",
+    "evidence": ""
+  }
+]
