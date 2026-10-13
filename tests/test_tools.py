@@ -27,6 +27,7 @@ EXPECTED_TOOLS = {
     "graph_get_user": {"user_id"},
     "graph_update_user": {"user_id"},
     "graph_assign_manager": {"user_id", "manager_id"},
+    "graph_remove_manager": {"user_id"},
     "graph_list_auth_methods": {"user_id"},
     "graph_revoke_sessions": {"user_id"},
     "graph_assign_groups": {"user_id", "group_ids"},
@@ -65,6 +66,7 @@ _NON_READ_ONLY = {
     "graph_reset_password",
     "graph_update_user",
     "graph_assign_manager",
+    "graph_remove_manager",
     "graph_revoke_sessions",
     "graph_assign_groups",
     "graph_remove_group_member",
@@ -115,7 +117,11 @@ async def test_tools_list_snapshot():
     # tools only walked membership from the user side; nothing listed who is
     # in a given group. proxyAddresses lookup was added as a parameter on
     # graph_check_user_exists, not a new tool — same question, another key.
-    assert len(names) <= 37, "tool count should stay within SOP's <=20 guideline (+17 justified)"
+    # +1 for graph_remove_manager (PRD-20393): offboarding needed to clear a
+    # manager without assigning a replacement; graph_assign_manager's
+    # manager_id stays required rather than becoming an optional "mode flag"
+    # (see the calendar/mail notes above).
+    assert len(names) <= 38, "tool count should stay within SOP's <=20 guideline (+18 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -1294,6 +1300,351 @@ async def test_get_user_returns_given_name_and_surname():
     assert "givenName" in select
     assert "surname" in select
     assert "employeeId" in select
+
+
+# --- PRD-20393: offboarding Graph interface changes -------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_user_groups_paginates_with_skiptoken():
+    """AC1/TC1: chaining next_page_token across calls must return every
+    group exactly once and terminate with has_more=false, next_page_token=null."""
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    client._result = {
+        "value": [{"id": "g1", "groupTypes": [], "mailEnabled": False}],
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/u1/memberOf?$skiptoken=P1",
+    }
+    first = json.loads(
+        (await mcp.call_tool("graph_list_user_groups", {"user_id": "u1"}))[0][0].text
+    )
+    assert first["has_more"] is True
+    assert first["next_page_token"] == "P1"
+    assert [g["id"] for g in first["groups"]] == ["g1"]
+
+    client._result = {"value": [{"id": "g2", "groupTypes": [], "mailEnabled": False}]}
+    second = json.loads(
+        (
+            await mcp.call_tool("graph_list_user_groups", {"user_id": "u1", "page_token": "P1"})
+        )[0][0].text
+    )
+    assert second["has_more"] is False
+    assert second["next_page_token"] is None
+    assert [g["id"] for g in second["groups"]] == ["g2"]
+    assert client.calls[1][1]["$skiptoken"] == "P1"
+
+
+@pytest.mark.asyncio
+async def test_list_user_groups_returns_group_type_mail_enabled_and_sync_source():
+    """AC2/TC2: every group entry must report groupTypes, mailEnabled and a
+    sync_source derived from onPremisesSyncEnabled."""
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    client._result = {
+        "value": [
+            {
+                "id": "g1",
+                "groupTypes": ["Unified"],
+                "mailEnabled": True,
+                "onPremisesSyncEnabled": True,
+            },
+            {"id": "g2", "groupTypes": [], "mailEnabled": False, "onPremisesSyncEnabled": None},
+        ]
+    }
+    result = json.loads(
+        (await mcp.call_tool("graph_list_user_groups", {"user_id": "u1"}))[0][0].text
+    )
+
+    by_id = {g["id"]: g for g in result["groups"]}
+    assert by_id["g1"]["sync_source"] == "on-premises"
+    assert by_id["g1"]["mailEnabled"] is True
+    assert by_id["g1"]["groupTypes"] == ["Unified"]
+    assert by_id["g2"]["sync_source"] == "cloud"
+    assert "onPremisesSyncEnabled" in client.calls[0][1]["$select"]
+
+
+@pytest.mark.asyncio
+async def test_list_groups_paginates_with_skiptoken():
+    """AC3/TC3: graph_list_groups must follow the same one-page-per-call
+    pagination contract as graph_list_user_groups/graph_list_group_members."""
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    client._result = {
+        "value": [{"id": "g1"}],
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/groups?$skiptoken=P1",
+    }
+    first = json.loads((await mcp.call_tool("graph_list_groups", {}))[0][0].text)
+    assert first["has_more"] is True
+    assert first["next_page_token"] == "P1"
+
+    client._result = {"value": [{"id": "g2"}]}
+    second = json.loads(
+        (await mcp.call_tool("graph_list_groups", {"page_token": "P1"}))[0][0].text
+    )
+    assert second["has_more"] is False
+    assert second["next_page_token"] is None
+    assert client.calls[1][1]["$skiptoken"] == "P1"
+
+
+@pytest.mark.asyncio
+async def test_list_users_paginates_with_skiptoken():
+    """AC4/TC4: graph_list_users must follow the one-page-per-call contract,
+    chaining next_page_token rather than walking pages internally."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    client._result = {
+        "value": [{"id": "u1"}],
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/users?$skiptoken=P1",
+    }
+    first = json.loads((await mcp.call_tool("graph_list_users", {}))[0][0].text)
+    assert first["has_more"] is True
+    assert first["next_page_token"] == "P1"
+
+    client._result = {"value": [{"id": "u2"}]}
+    second = json.loads(
+        (await mcp.call_tool("graph_list_users", {"page_token": "P1"}))[0][0].text
+    )
+    assert second["has_more"] is False
+    assert second["next_page_token"] is None
+    assert client.calls[1][1]["$skiptoken"] == "P1"
+
+
+@pytest.mark.asyncio
+async def test_update_user_omitted_new_fields_are_not_sent():
+    """AC5/TC5: omitting the five new fields must not add any of their keys
+    to the PATCH body -- only whatever else was actually passed."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_update_user", {"user_id": "u1", "job_title": "Engineer"})
+
+    assert client.methods == ["PATCH"]
+    assert client.bodies[0] == {"jobTitle": "Engineer"}
+    for key in ("employeeId", "userPrincipalName", "displayName", "givenName", "surname"):
+        assert key not in client.bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_update_user_explicit_null_clears_field():
+    """AC6/TC6: clearing one of the five fields sends that key as null and no
+    other new key.
+
+    Implemented via clear_given_name (a boolean flag mirroring employee_id's
+    already-shipped clear_employee_id, PRD-20321) rather than a literal JSON
+    null on given_name. Deviation from AC6's literal "explicit null" wording
+    is deliberate and documented in docs/tickets/PRD-20393.md Self-test: it
+    keeps graph_update_user internally consistent (employee_id already uses
+    this shape) and matches docs/modules/users.md's explicit guidance to
+    reuse it for future tri-state fields, discovered only after this ticket's
+    design was written (PRD-20321 merged into master the day before/same day
+    as this design). user_principal_name/display_name intentionally have no
+    clear_* flag at all -- see test_update_user_allows_verified_upn_domain's
+    module and the Self-test note -- because Graph documents both as
+    not-nullable; a null PATCH for either would always be rejected by a real
+    tenant regardless of what this fake client would accept.
+    """
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_update_user", {"user_id": "u1", "clear_given_name": True})
+
+    assert client.methods == ["PATCH"]
+    assert client.bodies[0] == {"givenName": None}
+
+
+@pytest.mark.asyncio
+async def test_update_user_rejects_given_name_and_clear_together():
+    """Dev-added (source: dev, not in the groomed AC set): given_name and
+    clear_given_name are mutually exclusive, mirroring employee_id's existing
+    validation -- flagging here rather than silently assuming it."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    result = await mcp.call_tool(
+        "graph_update_user",
+        {"user_id": "u1", "given_name": "Alice", "clear_given_name": True},
+    )
+
+    assert client.calls == []
+    assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_update_user_rejects_unverified_upn_domain():
+    """AC7/TC7: a UPN on a domain that is not verified for this tenant must
+    be rejected before any PATCH call is made to Graph."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    client._result = {"value": [{"id": "contoso.com", "isVerified": True}]}
+    result = await mcp.call_tool(
+        "graph_update_user", {"user_id": "u1", "user_principal_name": "alice@evil.example"}
+    )
+
+    assert client.methods == ["GET"]
+    assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_update_user_allows_verified_upn_domain():
+    """AC8/TC8: a UPN on a verified tenant domain must be sent through to
+    the PATCH call."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    client._result = {"value": [{"id": "contoso.com", "isVerified": True}]}
+    await mcp.call_tool(
+        "graph_update_user", {"user_id": "u1", "user_principal_name": "alice@contoso.com"}
+    )
+
+    assert client.methods == ["GET", "PATCH"]
+    assert client.calls[0][0] == "/domains"
+    assert client.bodies[0] == {"userPrincipalName": "alice@contoso.com"}
+
+
+@pytest.mark.asyncio
+async def test_remove_manager_deletes_manager_ref():
+    """AC9/TC9: removing a user's manager issues DELETE .../manager/$ref and
+    reports status=removed."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    result = json.loads(
+        (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
+    )
+
+    assert client.methods == ["DELETE"]
+    assert client.calls[0][0] == "/users/u1/manager/$ref"
+    assert result == {"status": "removed", "user_id": "u1"}
+
+
+class _DeleteRaisingClient:
+    """GraphClient stand-in whose DELETE always raises a given status, to
+    exercise graph_remove_manager's 404-is-not-an-error path (AC10)."""
+
+    def __init__(self, status_code: int):
+        self._status_code = status_code
+        self.calls: list[str] = []
+
+    async def delete(self, path: str):
+        self.calls.append(path)
+        raise GraphError(self._status_code, "boom")
+
+
+@pytest.mark.asyncio
+async def test_remove_manager_is_idempotent_on_missing_manager():
+    """AC10/TC10: a 404 from Graph (no manager set) must come back as
+    status=no_manager, not an error envelope, and be safe to call again."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    mcp = FastMCP(name="test")
+    client = _DeleteRaisingClient(404)
+    users.register(mcp, lambda: client)
+
+    result = json.loads(
+        (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
+    )
+    assert result == {"status": "no_manager", "user_id": "u1"}
+
+    # Calling again is equally successful -- idempotent.
+    result2 = json.loads(
+        (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
+    )
+    assert result2 == {"status": "no_manager", "user_id": "u1"}
+
+
+@pytest.mark.asyncio
+async def test_get_user_default_select_includes_new_fields():
+    """AC11/TC11: with no select param, the default $select must include
+    proxyAddresses, identities and the on-premises sync fields, alongside
+    today's default set (and the $expand=manager it already carried)."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_get_user", {"user_id": "u1"})
+
+    select = client.calls[0][1]["$select"]
+    for field in (
+        "proxyAddresses",
+        "identities",
+        "onPremisesSyncEnabled",
+        "onPremisesLastSyncDateTime",
+        "onPremisesDistinguishedName",
+    ):
+        assert field in select, f"{field} missing from default $select"
+    assert "$expand" in client.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_get_user_custom_select_narrows_fields():
+    """AC12/TC12: a select param must produce a $select of exactly those
+    fields plus id, and the default $expand=manager must not be added."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool("graph_get_user", {"user_id": "u1", "select": ["displayName", "mail"]})
+
+    assert client.calls[0][1]["$select"] == "id,displayName,mail"
+    assert "$expand" not in client.calls[0][1]
+
+
+class _RaisingGetClient:
+    """GraphClient stand-in whose GET always raises, to confirm the three
+    list tools return the structured error envelope instead of propagating
+    an exception when Graph fails mid-pagination (AC13)."""
+
+    def __init__(self, status_code: int = 503):
+        self._status_code = status_code
+
+    async def get(self, path: str, params: dict | None = None, extra_headers: dict | None = None):
+        raise GraphError(self._status_code, "boom")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("graph_list_user_groups", {"user_id": "u1"}),
+        ("graph_list_groups", {}),
+        ("graph_list_users", {}),
+    ],
+)
+async def test_list_tools_surface_graph_error_instead_of_raising(tool_name, args):
+    """AC13/TC13: a GraphError from the single-page fetch must come back as
+    the existing error envelope, not propagate as an exception, for all
+    three list tools touched by this ticket."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import groups, users
+
+    mcp = FastMCP(name="test")
+    client = _RaisingGetClient(503)
+    groups.register(mcp, lambda: client)
+    users.register(mcp, lambda: client)
+
+    result = await mcp.call_tool(tool_name, args)
+    payload = json.loads(result[0][0].text)
+    assert payload["error"]["code"] == "upstream_error"
+
+
+@pytest.mark.asyncio
+async def test_update_user_still_rejects_when_nothing_to_update():
+    """AC14/TC14 (regression): with none of the old or new fields set, the
+    existing "nothing to update" rejection must still fire -- the five new
+    fields and their clear_* companions must not count as always-present."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    result = await mcp.call_tool("graph_update_user", {"user_id": "u1"})
+
+    assert client.calls == []
+    assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
 
 
 @pytest.mark.asyncio

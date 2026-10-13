@@ -18,3 +18,14 @@
 - 新字段纯增量；`graph_create_user` 响应里没有任何既有字段被改名或删除（AC4），合并逻辑每次调用都构造一个全新的 `dict`，没有任何共享/模块级状态（AC5）。
 - 测试覆盖：`tests/test_tools.py::test_create_user_response_confirms_forced_password_change`、`::test_create_user_description_documents_forced_password_change`、`::test_create_user_error_envelope_has_no_password_confirmation`、`::test_create_user_response_is_additive_only`、`::test_create_user_confirmation_is_per_call_not_shared_state`（均为本单新增，在 `3570af5` 上全部通过）。
 - 自动化测试未覆盖的部分（需要真实/沙箱 Entra ID 租户才能验证——见 `docs/tickets/PRD-20412.zh.md` 的「自测」一节，TC6/AC6）：用这种方式创建的账号，首次登录时 Entra 是否真的会弹出强制改密码界面。这与上面 PRD-20321 记录过的 `employeeId` 目录 schema 缺口属于同一类本地盲区——连接器侧的请求已验证；租户侧的强制执行是 Graph 一个有据可查的既有行为，但本单没有独立重新验证它。
+
+## PRD-20393 · 2026-10-13
+
+- `graph_update_user`（`src/graph_mcp/tools/users.py` @ `722e955`）新增 `user_principal_name`、`display_name`、`given_name`/`clear_given_name`、`surname`/`clear_surname`。`user_principal_name` 的改动在发出任何 PATCH 之前，会先用 `_common.verified_domains(client)`（新辅助函数，查 `/domains?$select=id,isVerified`，与 `graph_list_domains` 自己那个更丰富的查询是分开的）做域名预检。
+- 与本单自己的设计文档有意背离的一点：`given_name`/`surname` 用的是 `clear_<field>` 布尔开关形状，不是设计提出的 `_UNSET` 哨兵 + 字面 null 形状——沿用了 PRD-20321 当天已经为 `employee_id` 定下的形状（见上面 PRD-20321 那条："以后如果还要给这个工具加一个需要三态的字段，应该照 employee_id/clear_employee_id 这对参数的形状走，不要另造一套"）。`graph_update_user` 现在对它支持的三个可空字符串字段只有一套三态机制，不是两套。
+- `user_principal_name` 与 `display_name` 刻意**没有** clear_* 选项——Microsoft Graph 把这两者都记成 `user` 资源上不可为空的属性；真实租户会把其中任一个的 null PATCH 拒成 400。以后谁要给这个工具加新的可能可空字段，先查 Graph 自己的 schema 是否真的可空，别想当然套用 clear_X 这个形状。
+- `graph_get_user` 的默认 `$select`（`:397-434` @ `722e955`）扩充了 `proxyAddresses,identities,onPremisesSyncEnabled,onPremisesLastSyncDateTime,onPremisesDistinguishedName`（常量 `_USER_PROFILE_SELECT`）；新增可选参数 `select: list[str] | None`，传入时会整体替换默认字段列表（同时丢掉默认的 `$expand=manager`）。
+- 新工具 `graph_remove_manager`（`DELETE /users/{id}/manager/$ref`），404→`status=no_manager`，与 `groups.py` 里 `graph_remove_group_member` 的 404→`not_a_member` 处理同一个模式。工具数上限 37→38。
+- `graph_list_users`（`:151-219` @ `722e955`）从「内部走完所有页直到 max_results」改成单 Graph 页/每次调用（`page_token`/`next_page_token`），和 `graph_list_group_members` 既有契约一致——两个分组列表工具的同类改动见 `groups.py` 的模块文档。
+- 测试覆盖：`tests/test_tools.py::test_update_user_omitted_new_fields_are_not_sent`、`::test_update_user_explicit_null_clears_field`、`::test_update_user_rejects_given_name_and_clear_together`、`::test_update_user_rejects_unverified_upn_domain`、`::test_update_user_allows_verified_upn_domain`、`::test_update_user_still_rejects_when_nothing_to_update`、`::test_remove_manager_deletes_manager_ref`、`::test_remove_manager_is_idempotent_on_missing_manager`、`::test_get_user_default_select_includes_new_fields`、`::test_get_user_custom_select_narrows_fields`、`::test_list_users_paginates_with_skiptoken`（均为本单新增，在 `722e955` 上全部通过）。
+- 自动化测试未覆盖的部分（需要真实双租户 Entra 环境才能验证——见 `docs/tickets/PRD-20393.zh.md` 的「自测」一节，TC15/AC15）：真正的跨租户隔离。这个服务器本来就没有自己的租户检查逻辑（隔离完全依赖调用方的 bearer token）——不是本单引入的缺口，只是本单第一次把它写成一条明确的 AC。

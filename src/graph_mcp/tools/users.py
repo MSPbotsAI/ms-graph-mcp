@@ -8,7 +8,7 @@ from pydantic import Field
 
 from .._json import dump_json_capped, error_envelope
 from ..api_client import DEFAULT_BASE_URL, GraphClient, GraphError
-from ._common import NO_TOKEN, odata_quote
+from ._common import NO_TOKEN, odata_quote, skiptoken, verified_domains
 
 # Our own ceiling on how many results a list tool returns to the agent
 # (SOP: default <=50, hard cap <=200). Separate from Graph's own $top
@@ -24,6 +24,21 @@ _GRAPH_TOP_MAX = 999
 # step, not a profile read.
 _USER_LIST_SELECT = (
     "id,displayName,userPrincipalName,mail,accountEnabled,jobTitle,department"
+)
+
+# graph_get_user's default $select (PRD-20393: widened with proxyAddresses,
+# identities and the on-premises sync fields needed to decide whether an
+# offboarding change belongs here or in on-prem AD; employeeId/givenName/
+# surname were already added by PRD-20321).
+_USER_PROFILE_SELECT = (
+    "id,displayName,givenName,surname,userPrincipalName,mail,"
+    "accountEnabled,usageLocation,jobTitle,department,mobilePhone,"
+    "businessPhones,officeLocation,streetAddress,city,state,postalCode,"
+    "companyName,employeeHireDate,employeeId,"
+    "proxyAddresses,identities,onPremisesSyncEnabled,"
+    "onPremisesLastSyncDateTime,onPremisesDistinguishedName,"
+    "provisionedPlans,assignedLicenses,"
+    "licenseAssignmentStates"
 )
 
 _HIRE_DATE_DESC = (
@@ -167,26 +182,33 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             ),
         ] = None,
         max_results: Annotated[
-            int, Field(description="Max users to return (default 50, hard cap 200).")
+            int, Field(description="Max users per page (default 50, hard cap 200).")
         ] = _DEFAULT_MAX_RESULTS,
+        page_token: Annotated[
+            str | None,
+            Field(description="next_page_token from the previous page; omit for the first page."),
+        ] = None,
     ) -> str:
-        """List or search Entra ID users by display name.
+        """List or search Entra ID users by display name, one page at a time.
 
         Use to browse the directory or resolve a partial name to a user's
-        id/UPN for the other user tools — graph_check_user_exists needs an
-        exact UPN or mail, so it can't answer "who is called Alice?".
-        Returns id, displayName, userPrincipalName, mail, accountEnabled,
-        jobTitle and department for each match.
+        id/UPN — graph_check_user_exists needs an exact UPN or mail, so it
+        can't answer "who is called Alice?". Returns displayName,
+        userPrincipalName, mail, accountEnabled, jobTitle, department. When
+        has_more is true, call again with next_page_token for the next page
+        (one Graph page per call now — PRD-20393).
         """
         client = client_factory()
         if client is None:
             return NO_TOKEN
 
-        max_results = min(max_results, _HARD_CAP_MAX_RESULTS)
+        max_results = max(1, min(max_results, _HARD_CAP_MAX_RESULTS))
         params: dict = {
             "$select": _USER_LIST_SELECT,
             "$top": str(min(max_results, _GRAPH_TOP_MAX)),
         }
+        if page_token:
+            params["$skiptoken"] = page_token
         clauses: list[str] = []
         if display_name:
             quoted = odata_quote(display_name)
@@ -200,20 +222,17 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             params["$filter"] = " and ".join(clauses)
 
         try:
-            users: list = []
             result = await client.get("/users", params=params)
-            has_more = False
-            while result:
-                users.extend(result.get("value", []))
-                if len(users) >= max_results:
-                    users = users[:max_results]
-                    has_more = True
-                    break
-                next_link = result.get("@odata.nextLink")
-                if not next_link:
-                    break
-                result = await client.get(next_link)
-            return dump_json_capped({"count": len(users), "users": users, "has_more": has_more})
+            users = result.get("value", [])[:max_results]
+            next_token = skiptoken(result.get("@odata.nextLink"))
+            return dump_json_capped(
+                {
+                    "count": len(users),
+                    "users": users,
+                    "has_more": next_token is not None,
+                    "next_page_token": next_token,
+                }
+            )
         except GraphError as e:
             return e.to_envelope()
 
@@ -389,34 +408,40 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         user_id: Annotated[
             str, Field(description="Target user's id (GUID) or userPrincipalName.")
         ],
+        select: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Return only these fields (plus id) instead of the full "
+                    "default profile. Omit manager's $expand when narrowing — "
+                    "ask for 'manager' explicitly if you need it."
+                )
+            ),
+        ] = None,
     ) -> str:
-        """Read an Entra ID user's full profile, including manager and licenses.
+        """Read an Entra ID user's full profile: manager, licenses, proxy
+        addresses, identities, on-premises sync state.
 
-        Use to inspect an existing user's access profile (e.g. before
-        mirroring it onto a new hire), or to verify a newly created user is
-        fully provisioned. licenseAssignmentStates[].assignedByGroup: null
-        means a license is assigned directly (needs manual removal);
-        non-null means group-based (clears once removed from that group).
+        Use before mirroring onto a new hire, to verify provisioning, or to
+        decide whether a change belongs in on-premises AD instead
+        (onPremisesSyncEnabled). licenseAssignmentStates[].assignedByGroup:
+        null means directly assigned; non-null means group-based. Pass
+        select to narrow the response to just the fields you need.
         """
         client = client_factory()
         if client is None:
             return NO_TOKEN
 
+        params: dict = {}
+        if select:
+            fields = ["id"] + [f for f in select if f != "id"]
+            params["$select"] = ",".join(fields)
+        else:
+            params["$select"] = _USER_PROFILE_SELECT
+            params["$expand"] = "manager($select=id,displayName,userPrincipalName)"
+
         try:
-            result = await client.get(
-                f"/users/{user_id}",
-                params={
-                    "$select": (
-                        "id,displayName,givenName,surname,userPrincipalName,mail,"
-                        "accountEnabled,usageLocation,jobTitle,department,mobilePhone,"
-                        "businessPhones,officeLocation,streetAddress,city,state,postalCode,"
-                        "companyName,employeeHireDate,employeeId,"
-                        "provisionedPlans,assignedLicenses,"
-                        "licenseAssignmentStates"
-                    ),
-                    "$expand": "manager($select=id,displayName,userPrincipalName)",
-                },
-            )
+            result = await client.get(f"/users/{user_id}", params=params)
             return dump_json_capped(result)
         except GraphError as e:
             return e.to_envelope()
@@ -473,12 +498,73 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 )
             ),
         ] = False,
+        user_principal_name: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "New sign-in UPN, e.g. alice@newdomain.com (PRD-20393). "
+                    "Rejected if the domain is not one of the tenant's "
+                    "verified domains (graph_list_domains). Cannot be "
+                    "cleared — Graph requires every user to keep a non-empty "
+                    "userPrincipalName."
+                )
+            ),
+        ] = None,
+        display_name: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Full display name to set (PRD-20393). Cannot be "
+                    "cleared — Graph requires every user to keep a "
+                    "non-empty displayName."
+                )
+            ),
+        ] = None,
+        given_name: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "First name to set (PRD-20393). Mutually exclusive "
+                    "with clear_given_name."
+                )
+            ),
+        ] = None,
+        clear_given_name: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set True to clear givenName to null (PRD-20393). "
+                    "Mutually exclusive with given_name."
+                )
+            ),
+        ] = False,
+        surname: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Last name to set (PRD-20393). Mutually exclusive "
+                    "with clear_surname."
+                )
+            ),
+        ] = None,
+        clear_surname: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set True to clear surname to null (PRD-20393). "
+                    "Mutually exclusive with surname."
+                )
+            ),
+        ] = False,
     ) -> str:
         """Update attributes on an existing Entra ID user.
 
         Only the fields you provide are changed. Setting account_enabled=False
         blocks new sign-ins immediately, but sessions issued before the change
         stay valid until they expire or are revoked with graph_revoke_sessions.
+        A user_principal_name change is rejected up front if its domain is
+        not verified for this tenant; use graph_remove_manager separately to
+        clear a manager, not this tool.
         """
         client = client_factory()
         if client is None:
@@ -490,12 +576,51 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 "Provide at most one of employee_id or clear_employee_id.",
                 False,
             )
+        if given_name is not None and clear_given_name:
+            return error_envelope(
+                "invalid_argument",
+                "Provide at most one of given_name or clear_given_name.",
+                False,
+            )
+        if surname is not None and clear_surname:
+            return error_envelope(
+                "invalid_argument",
+                "Provide at most one of surname or clear_surname.",
+                False,
+            )
+
+        if user_principal_name is not None:
+            domain = (
+                user_principal_name.rsplit("@", 1)[-1].lower()
+                if "@" in user_principal_name
+                else ""
+            )
+            verified = {d.lower() for d in await verified_domains(client)}
+            if not domain or domain not in verified:
+                return error_envelope(
+                    "invalid_argument",
+                    f"userPrincipalName domain '{domain or user_principal_name}' "
+                    "is not a verified domain for this tenant.",
+                    False,
+                )
 
         body: dict = {}
         if employee_id is not None:
             body["employeeId"] = employee_id
         elif clear_employee_id:
             body["employeeId"] = None
+        if user_principal_name is not None:
+            body["userPrincipalName"] = user_principal_name
+        if display_name is not None:
+            body["displayName"] = display_name
+        if given_name is not None:
+            body["givenName"] = given_name
+        elif clear_given_name:
+            body["givenName"] = None
+        if surname is not None:
+            body["surname"] = surname
+        elif clear_surname:
+            body["surname"] = None
         if account_enabled is not None:
             body["accountEnabled"] = account_enabled
         if usage_location is not None:
@@ -544,8 +669,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     ) -> str:
         """Set an Entra ID user's manager.
 
-        Sets/replaces the manager relationship only — there is no option
-        here to clear a user's manager entirely (not exposed by this tool).
+        Sets/replaces the manager relationship only — use graph_remove_manager
+        to clear a user's manager entirely.
         """
         client = client_factory()
         if client is None:
@@ -559,6 +684,30 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 {"status": "success", "user_id": user_id, "manager_id": manager_id}
             )
         except GraphError as e:
+            return e.to_envelope()
+
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
+    )
+    async def graph_remove_manager(
+        user_id: Annotated[str, Field(description="Target user's id (GUID) or userPrincipalName.")],
+    ) -> str:
+        """Remove an Entra ID user's manager, without needing a replacement.
+
+        Use during offboarding to clear the manager relationship (e.g. before
+        reassigning the user's reports to someone else). Calling this on a
+        user with no manager set is not an error — it reports no_manager.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        try:
+            await client.delete(f"/users/{user_id}/manager/$ref")
+            return dump_json_capped({"status": "removed", "user_id": user_id})
+        except GraphError as e:
+            if e.status_code == 404:
+                return dump_json_capped({"status": "no_manager", "user_id": user_id})
             return e.to_envelope()
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))

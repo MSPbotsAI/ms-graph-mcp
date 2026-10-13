@@ -1,0 +1,11 @@
+# Module: `src/graph_mcp/tools/groups.py` (group membership / routing)
+
+First entry in this module doc.
+
+## PRD-20393 · 2026-10-13
+
+- `graph_list_user_groups` and `graph_list_groups` (`src/graph_mcp/tools/groups.py` @ `722e955`) switched from "walk every Graph page internally, stop at max_results" to one-Graph-page-per-call, matching `graph_list_group_members`'s existing contract: `page_token` in, `next_page_token` out via the shared `_common.skiptoken` helper (moved here from being private to this file — now also used by `users.py::graph_list_users`). A caller that relied on one call returning everything up to `max_results` must now follow `next_page_token` instead; no caller of these two tools was found inside this repo (they're exposed only to external MCP clients), so this blast radius could not be fully enumerated from this repo alone — flagged in `docs/tickets/PRD-20393.md` Open questions for groom, not silently assumed safe.
+- `graph_list_user_groups` additionally derives `sync_source` ("on-premises"/"cloud") per group from `onPremisesSyncEnabled`, the same derivation `graph_get_group` (`:301-332`) already does — now the second place in this file using that pattern; any future tool needing to classify a group's sync origin should reuse the same `"on-premises" if obj.get("onPremisesSyncEnabled") else "cloud"` expression, not invent another phrasing.
+- `_skiptoken` moved out to `_common.py` (renamed `skiptoken`, no longer private) since it's now shared by two files, not one.
+- Test coverage: `tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken`, `::test_list_user_groups_returns_group_type_mail_enabled_and_sync_source`, `::test_list_groups_paginates_with_skiptoken`, `::test_list_tools_surface_graph_error_instead_of_raising` (parametrized, covers both tools here plus `graph_list_users`) (all added in this ticket, all passing at `722e955`).
+- Not covered by automated tests: none identified for this file's changes — the pagination/sync_source logic is fully exercised against the repo's fake Graph client; no live-tenant-only behavior was touched here (contrast with `users.py`'s UPN/manager changes, which do have a documented live-tenant blind spot).
