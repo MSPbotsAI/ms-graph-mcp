@@ -109,7 +109,7 @@
       "Inspect each response"
     ],
     "expect": "Every call returns a 404/401-derived error envelope (not_found or unauthorized) from Graph; no tenant-B field value appears in any response",
-    "result": "untested",
-    "evidence": ""
+    "result": "blocked",
+    "evidence": "Not executed - local blind spot. This dev sandbox has no live Microsoft Graph tenant/token; the only available test double is the fake _CapturingClient used in tests/test_tools.py, which cannot exercise real Graph's own tenant-scoping (it never enforces any isolation itself -- see the Non-functional section of docs/tickets/PRD-20393.md: isolation is entirely delegated to the caller's bearer token). Needs: a real two-tenant Entra setup (tenant A token, a tenant-B user/group id) to execute the steps above."
   }
 ]

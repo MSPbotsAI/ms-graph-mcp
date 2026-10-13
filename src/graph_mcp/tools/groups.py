@@ -1,5 +1,4 @@
 from collections.abc import Callable
-from urllib.parse import parse_qs, urlsplit
 from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
@@ -8,7 +7,7 @@ from pydantic import Field
 
 from .._json import dump_json_capped, error_envelope
 from ..api_client import GraphClient, GraphError
-from ._common import NO_TOKEN, odata_quote
+from ._common import NO_TOKEN, odata_quote, skiptoken
 
 _DIRECTORY_OBJECT_URL = "https://graph.microsoft.com/v1.0/directoryObjects/{user_id}"
 
@@ -23,16 +22,6 @@ _GRAPH_TOP_MAX = 999
 # walk (at $top=999/page this covers ~50k groups) — a runaway pagination
 # loop should stop rather than hang the request indefinitely.
 _MAX_GROUP_LIST_PAGES = 50
-
-
-def _skiptoken(next_link: str | None) -> str | None:
-    """Pull $skiptoken out of an @odata.nextLink. Only the token goes back to
-    the caller — never the full URL — so a page_token can't point the client
-    (and its bearer token) at another host."""
-    if not next_link:
-        return None
-    values = parse_qs(urlsplit(next_link).query).get("$skiptoken")
-    return values[0] if values else None
 
 
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
@@ -80,47 +69,53 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     async def graph_list_user_groups(
         user_id: Annotated[str, Field(description="User's id (GUID) or userPrincipalName.")],
         max_results: Annotated[
-            int, Field(description="Max groups to return (default 50, hard cap 200).")
+            int, Field(description="Max groups per page (default 50, hard cap 200).")
         ] = _DEFAULT_MAX_RESULTS,
+        page_token: Annotated[
+            str | None,
+            Field(description="next_page_token from the previous page; omit for the first page."),
+        ] = None,
     ) -> str:
-        """List the Entra ID groups a user is a direct member of.
+        """List groups a user directly belongs to, one page at a time.
 
-        Use to read an existing user's group memberships, e.g. to mirror
-        them onto a new hire via graph_assign_groups.
+        Use to mirror memberships onto a new hire, or to route a group
+        through Graph, Exchange or AD during offboarding — each entry
+        includes groupTypes, mailEnabled and sync_source ("on-premises" for
+        AD-synced groups, else "cloud"). has_more=true: call again with
+        next_page_token (one Graph page per call — PRD-20393).
         """
         client = client_factory()
         if client is None:
             return NO_TOKEN
 
-        max_results = min(max_results, _HARD_CAP_MAX_RESULTS)
+        max_results = max(1, min(max_results, _HARD_CAP_MAX_RESULTS))
+        params: dict = {
+            "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled,onPremisesSyncEnabled",
+            "$top": str(min(max_results, _GRAPH_TOP_MAX)),
+        }
+        if page_token:
+            params["$skiptoken"] = page_token
 
         try:
-            groups: list = []
-            result = await client.get(
-                f"/users/{user_id}/memberOf",
-                params={
-                    "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
-                    "$top": str(min(max_results, _GRAPH_TOP_MAX)),
-                },
-            )
-            capped = False
-            while result and not capped:
-                for obj in result.get("value", []):
-                    # memberOf can also return directoryRoles; keep only groups.
-                    if obj.get("@odata.type", "").endswith("group") or "groupTypes" in obj:
-                        groups.append(obj)
-                        if len(groups) >= max_results:
-                            capped = True
-                            break
-                if capped:
-                    break
-                next_link = result.get("@odata.nextLink")
-                if not next_link:
-                    break
-                result = await client.get(next_link)
-            has_more = capped or bool(result and result.get("@odata.nextLink"))
+            result = await client.get(f"/users/{user_id}/memberOf", params=params)
+            groups = []
+            for obj in result.get("value", []):
+                # memberOf can also return directoryRoles; keep only groups.
+                if not (obj.get("@odata.type", "").endswith("group") or "groupTypes" in obj):
+                    continue
+                obj["sync_source"] = (
+                    "on-premises" if obj.get("onPremisesSyncEnabled") else "cloud"
+                )
+                groups.append(obj)
+            next_token = skiptoken(result.get("@odata.nextLink"))
             return dump_json_capped(
-                {"user_id": user_id, "count": len(groups), "groups": groups, "has_more": has_more}
+                {
+                    "user_id": user_id,
+                    "count": len(groups),
+                    "groups": groups,
+                    "has_more": next_token is not None,
+                    "next_page_token": next_token,
+                }
             )
         except GraphError as e:
             return e.to_envelope()
@@ -137,23 +132,31 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             bool, Field(description="When True, match display_name exactly instead of by prefix.")
         ] = False,
         max_results: Annotated[
-            int, Field(description="Max groups to return (default 50, hard cap 200).")
+            int, Field(description="Max groups per page (default 50, hard cap 200).")
         ] = _DEFAULT_MAX_RESULTS,
+        page_token: Annotated[
+            str | None,
+            Field(description="next_page_token from the previous page; omit for the first page."),
+        ] = None,
     ) -> str:
-        """List or search Entra ID groups by display name.
+        """List or search Entra ID groups by display name, one page at a time.
 
         Use to resolve a group name to its object id for graph_assign_groups.
+        When has_more is true, call again with next_page_token to get the
+        next page. (PRD-20393: see graph_list_user_groups's docstring for the
+        same one-page-per-call contract change.)
         """
         client = client_factory()
         if client is None:
             return NO_TOKEN
 
-        max_results = min(max_results, _HARD_CAP_MAX_RESULTS)
-        page_size = min(max_results, _GRAPH_TOP_MAX)
+        max_results = max(1, min(max_results, _HARD_CAP_MAX_RESULTS))
         params: dict = {
             "$select": "id,displayName,groupTypes,securityEnabled,mailEnabled",
-            "$top": str(page_size),
+            "$top": str(min(max_results, _GRAPH_TOP_MAX)),
         }
+        if page_token:
+            params["$skiptoken"] = page_token
         if display_name:
             quoted = odata_quote(display_name)
             if exact:
@@ -162,20 +165,17 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 params["$filter"] = f"startswith(displayName,'{quoted}')"
 
         try:
-            groups: list = []
             result = await client.get("/groups", params=params)
-            has_more = False
-            while result:
-                groups.extend(result.get("value", []))
-                if len(groups) >= max_results:
-                    groups = groups[:max_results]
-                    has_more = True
-                    break
-                next_link = result.get("@odata.nextLink")
-                if not next_link:
-                    break
-                result = await client.get(next_link)
-            return dump_json_capped({"count": len(groups), "groups": groups, "has_more": has_more})
+            groups = result.get("value", [])[:max_results]
+            next_token = skiptoken(result.get("@odata.nextLink"))
+            return dump_json_capped(
+                {
+                    "count": len(groups),
+                    "groups": groups,
+                    "has_more": next_token is not None,
+                    "next_page_token": next_token,
+                }
+            )
         except GraphError as e:
             return e.to_envelope()
 
@@ -366,7 +366,7 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             for m in result.get("value", [])[:max_results]:
                 odata_type = m.pop("@odata.type", "") or ""
                 members.append({**m, "member_type": odata_type.removeprefix("#microsoft.graph.")})
-            next_token = _skiptoken(result.get("@odata.nextLink"))
+            next_token = skiptoken(result.get("@odata.nextLink"))
             return dump_json_capped(
                 {
                     "group_id": group_id,
