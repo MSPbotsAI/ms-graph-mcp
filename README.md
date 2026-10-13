@@ -68,7 +68,7 @@ Connect your MCP client with:
 |---|---|---|
 | `graph_check_user_exists` | 按 UPN、邮箱或任一 proxy address（含别名，裸地址按 `smtp:` 匹配）查询 Entra ID 用户是否存在；proxy address 走 Graph 高级查询（`ConsistencyLevel: eventual` + `$count`）（PRD-20223） | `User.Read.All` |
 | `graph_list_users` | 列出/按显示名搜索 Entra ID 用户（前缀匹配，`exact=True` 改精确匹配），可按 `account_enabled` 过滤启用/禁用账号；默认返回 50 条、硬顶 200 条，分页走 `@odata.nextLink`，返回带 `has_more`。补的是「只知道名字片段、不知道准确 UPN」这个场景——`graph_check_user_exists` 要求准确 UPN/邮箱，答不了「有没有个叫 Alice 的」 | `User.Read.All` |
-| `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可；可一并写入办公地点、电话（`business_phones`/`mobile_phone`）、地址（`street_address`/`city`/`state`/`postal_code`）、`company_name`、`employee_hire_date`（PRD-20219） | `User.ReadWrite.All` |
+| `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可；可一并写入办公地点、电话（`business_phones`/`mobile_phone`）、地址（`street_address`/`city`/`state`/`postal_code`）、`company_name`、`employee_hire_date`（PRD-20219）。强制要求用户首次登录改密，且不可按调用关闭；调用成功时返回体会显式包含 `passwordChangeRequiredAtNextSignIn: true` 加以确认（PRD-20412） | `User.ReadWrite.All` |
 | `graph_get_user` | 读取用户完整资料，含 manager、已分配许可、以及每条许可的 `licenseAssignmentStates`（`assignedByGroup` 为 null=直接分配 / 非null=组分配继承） | `User.Read.All` |
 | `graph_update_user` | 更新用户属性（仅传入的字段会改动），含地址、公司名、入职日期；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
 | `graph_reset_password` | 管理员重置用户密码，下次登录强制改密 | `User.ReadWrite.All` + Password/User Administrator 角色 |
