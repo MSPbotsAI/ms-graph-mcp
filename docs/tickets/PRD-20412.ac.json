@@ -4,35 +4,45 @@
     "ac": "AC1",
     "text": "Given graph_create_user is called with the minimum required parameters and Graph returns 201, When the tool returns its result to the caller, Then the JSON includes passwordChangeRequiredAtNextSignIn: true.",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_create_user_response_confirms_forced_password_change"]
+    "tests": ["tests/test_tools.py::test_create_user_response_confirms_forced_password_change"],
+    "result": "pass",
+    "evidence": "uv run pytest -q tests/test_tools.py::test_create_user_response_confirms_forced_password_change -> 1 passed. Confirmed red beforehand: reverting src/graph_mcp/tools/users.py's merge (git stash) makes this test fail with KeyError on the missing field."
   },
   {
     "id": "TC2",
     "ac": "AC2",
     "text": "Given the MCP server's registered tools are introspected, When graph_create_user's description is read, Then it explicitly states that created accounts are configured to require a password change at next sign-in and that this is not configurable per call.",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_create_user_description_documents_forced_password_change"]
+    "tests": ["tests/test_tools.py::test_create_user_description_documents_forced_password_change"],
+    "result": "pass",
+    "evidence": "uv run pytest -q tests/test_tools.py::test_create_user_description_documents_forced_password_change -> 1 passed. Confirmed red beforehand against the pre-change docstring (missing 'next sign-in' / 'not configurable')."
   },
   {
     "id": "TC3",
     "ac": "AC3",
     "text": "Given Graph returns an error for POST /users (e.g. a conflicting userPrincipalName), When graph_create_user returns its error envelope, Then the response does not contain passwordChangeRequiredAtNextSignIn.",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_create_user_error_envelope_has_no_password_confirmation"]
+    "tests": ["tests/test_tools.py::test_create_user_error_envelope_has_no_password_confirmation"],
+    "result": "pass",
+    "evidence": "uv run pytest -q tests/test_tools.py::test_create_user_error_envelope_has_no_password_confirmation -> 1 passed. Already true pre-change too (no confirmation field existed at all yet) -- this test is a forward regression guard, not a red/green driver for this AC."
   },
   {
     "id": "TC4",
     "ac": "AC4",
     "text": "Given graph_create_user is called with only required parameters (no optional profile fields), When the response is compared against today's response shape, Then every field present today is still present and unchanged, plus the new confirmation field.",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_create_user_response_is_additive_only"]
+    "tests": ["tests/test_tools.py::test_create_user_response_is_additive_only"],
+    "result": "pass",
+    "evidence": "uv run pytest -q tests/test_tools.py::test_create_user_response_is_additive_only -> 1 passed. Confirmed red beforehand: without the merge, KeyError on 'passwordChangeRequiredAtNextSignIn'."
   },
   {
     "id": "TC5",
     "ac": "AC5",
     "text": "Given two consecutive graph_create_user calls use different tokens, passwords and display names, When both complete, Then each call's response (including the confirmation field) reflects only that call's own input, with nothing carried over from the other call.",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_create_user_confirmation_is_per_call_not_shared_state"]
+    "tests": ["tests/test_tools.py::test_create_user_confirmation_is_per_call_not_shared_state"],
+    "result": "pass",
+    "evidence": "uv run pytest -q tests/test_tools.py::test_create_user_confirmation_is_per_call_not_shared_state -> 1 passed. Confirmed red beforehand (missing field on both payloads); the merge builds a fresh dict per call (src/graph_mcp/tools/users.py, no module-level state), so no cross-call leakage is possible by construction."
   },
   {
     "id": "TC6",
@@ -45,7 +55,7 @@
       "Observe whether Microsoft presents a forced password-change screen before allowing access"
     ],
     "expect": "A 'Update your password' / forced password change screen appears before the account can proceed to any app, matching the Microsoft 365 admin center behavior shown in the ticket's attached screenshot.",
-    "result": "untested",
-    "evidence": "Not executed in the design leg: read-only code access only, no live/sandbox Entra ID tenant credentials available in this session. Left for legs/dev.md S5 self-test to attempt if a tenant is available."
+    "result": "blocked",
+    "evidence": "Not executed in the dev leg either: this session has no browser automation and no live/sandbox Entra ID tenant credentials (no Graph access token, no M365 admin account) -- per repro convention (legs/dev.md S4), bot never supplies credentials it doesn't have, and this case needs a real tenant, not a mock. Static-code substitute: `git diff -- src/graph_mcp/tools/users.py` shows line 284 (`\"forceChangePasswordNextSignIn\": True`) is untouched by this ticket's change -- the enforcement itself was already unconditional before this ticket and remains so; `uv run pytest -q` (80 passed, see gate) confirms the module still imports and compiles cleanly with this line intact. This is compile/static evidence that the request sent to Graph is correct; it is not evidence that Entra enforces it server-side, which only a live tenant can show. Recorded as blocked (not pass) per legs/dev.md S5: 'result 未执行且没写原因' is the failure mode this avoids, not a substitute for the live check -- same local-blind-spot category already recorded in docs/modules/users.md for PRD-20321 directory-schema behavior."
   }
 ]
