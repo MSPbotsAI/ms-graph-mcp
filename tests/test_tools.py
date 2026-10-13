@@ -733,7 +733,8 @@ async def test_send_mail_attaches_multiple_files_up_to_limit():
     sent = client.bodies[0]["message"]["attachments"]
     assert [a["name"] for a in sent] == [a["filename"] for a in atts]
     assert [a["contentBytes"] for a in sent] == [a["content_base64"] for a in atts]
-    assert all(a["contentType"] == "application/octet-stream" for a in sent)
+    # No content_type given -> guessed from the extension.
+    assert all(a["contentType"] == "text/plain" for a in sent)
 
 
 @pytest.mark.asyncio
@@ -816,6 +817,93 @@ async def test_send_mail_rejects_attachments_over_700kb_total():
     result = await _send(mcp, attachments=atts)
     assert result["error"]["code"] == "invalid_argument"
     assert "combined" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "mime_wrapped",
+        "data_uri",
+        "url_safe",
+        "no_padding",
+        "surrounding_whitespace",
+    ],
+)
+async def test_send_mail_accepts_common_base64_variants(variant):
+    # PRD-20416: agents hand over base64 from `base64` CLI (76-col wrapped),
+    # data: URIs, the URL-safe alphabet or with padding dropped. All decode to
+    # the same bytes, so the mail must go out with standard base64.
+    import base64
+
+    raw = bytes(range(256)) * 40 + b"<html>\xe6\x8a\xa5\xe5\x91\x8a</html>?>"
+    std = base64.b64encode(raw).decode()
+    value = {
+        "mime_wrapped": base64.encodebytes(raw).decode(),
+        "data_uri": "data:text/html;base64," + std,
+        "url_safe": base64.urlsafe_b64encode(raw).decode(),
+        "no_padding": std.rstrip("="),
+        "surrounding_whitespace": f"\n  {std}  \r\n",
+    }[variant]
+    assert value != std
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"filename": "r.html", "content_base64": value}])
+    assert result == {"status": "sent"}
+    sent = client.bodies[0]["message"]["attachments"][0]
+    assert sent["contentBytes"] == std
+    assert sent["contentType"] == "text/html"
+
+
+@pytest.mark.asyncio
+async def test_send_mail_encodes_content_text_attachment():
+    import base64
+
+    html = "<html><body><h1>月度报告</h1></body></html>"
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"filename": "report.html", "content_text": html}])
+    assert result == {"status": "sent"}
+    sent = client.bodies[0]["message"]["attachments"][0]
+    assert base64.b64decode(sent["contentBytes"], validate=True).decode("utf-8") == html
+    assert sent["contentType"] == "text/html"
+    assert sent["name"] == "report.html"
+
+
+@pytest.mark.asyncio
+async def test_send_mail_content_text_counts_utf8_bytes_against_limit():
+    mcp, client = _mail_mcp({})
+    # 166,667 three-byte chars = 500,001 bytes > 500 KB, though under 500k chars.
+    result = await _send(mcp, attachments=[{"filename": "big.txt", "content_text": "报" * 166_667}])
+    assert result["error"]["code"] == "invalid_argument"
+    assert "per-file" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "att",
+    [
+        {"filename": "x.txt"},
+        {"filename": "x.txt", "content_text": "a", "content_base64": "YQ=="},
+        {"filename": "x.txt", "content_text": ""},
+    ],
+)
+async def test_send_mail_requires_exactly_one_content_field(att):
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[att])
+    assert result["error"]["code"] == "invalid_argument"
+    assert "exactly one of 'content_base64' or 'content_text'" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_invalid_base64_points_to_content_text():
+    mcp, client = _mail_mcp({})
+    result = await _send(
+        mcp, attachments=[{"filename": "r.html", "content_base64": "<html>raw</html>"}]
+    )
+    assert result["error"]["code"] == "invalid_argument"
+    assert "content_text" in result["error"]["message"]
     assert client.calls == []
 
 
