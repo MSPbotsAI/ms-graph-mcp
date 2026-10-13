@@ -1073,6 +1073,136 @@ async def test_create_user_rejects_malformed_hire_date_without_calling_graph():
     assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
 
 
+# --- PRD-20412: confirm forced password-change at first sign-in -------------
+
+
+@pytest.mark.asyncio
+async def test_create_user_response_confirms_forced_password_change():
+    """AC1: Graph's own 201 response never includes passwordProfile (its
+    documented default property set omits it), so without an explicit
+    confirmation field the caller has no way to tell the account was
+    created with a forced password change — even though the body we sent
+    already requested it."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    result = await mcp.call_tool("graph_create_user", _BASE_CREATE_ARGS)
+    payload = json.loads(result[0][0].text)
+
+    assert payload["passwordChangeRequiredAtNextSignIn"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_user_description_documents_forced_password_change():
+    """AC2: a caller that only reads the tool definition (no source access)
+    must be able to tell every created account requires a password change
+    at next sign-in, and that this cannot be turned off per call."""
+    mcp = create_mcp_server(Settings())
+    tools = {t.name: t for t in await mcp.list_tools()}
+    description = " ".join((tools["graph_create_user"].description or "").lower().split())
+
+    assert "password" in description
+    assert "next sign-in" in description
+    assert "not configurable" in description
+
+
+@pytest.mark.asyncio
+async def test_create_user_error_envelope_has_no_password_confirmation():
+    """AC3: an account that was never created cannot have had any setting
+    take effect on it — the confirmation field must not leak into the
+    error path."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    client = _FailingPostClient(400)
+    mcp = FastMCP(name="test")
+    users.register(mcp, lambda: client)
+
+    result = await mcp.call_tool("graph_create_user", _BASE_CREATE_ARGS)
+    payload = json.loads(result[0][0].text)
+
+    assert "error" in payload
+    assert "passwordChangeRequiredAtNextSignIn" not in payload
+
+
+@pytest.mark.asyncio
+async def test_create_user_response_is_additive_only():
+    """AC4: every field present in today's response must still be present,
+    unchanged — the confirmation field is additive only, nothing is
+    renamed or removed."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    original_result = {
+        "id": "87d349ed-44d7-43e1-9a83-5f2406dee5bd",
+        "displayName": "Alice Smith",
+        "userPrincipalName": "alice@contoso.com",
+        "mail": "alice@contoso.com",
+    }
+    client = _CapturingClient(result=original_result)
+    mcp = FastMCP(name="test")
+    users.register(mcp, lambda: client)
+
+    result = await mcp.call_tool("graph_create_user", _BASE_CREATE_ARGS)
+    payload = json.loads(result[0][0].text)
+
+    for key, value in original_result.items():
+        assert payload[key] == value
+    assert payload["passwordChangeRequiredAtNextSignIn"] is True
+    assert set(payload) == set(original_result) | {"passwordChangeRequiredAtNextSignIn"}
+
+
+@pytest.mark.asyncio
+async def test_create_user_confirmation_is_per_call_not_shared_state():
+    """AC5: two consecutive calls with different tokens/passwords/names must
+    not leak into each other's response — the merge must build a fresh dict
+    per call, never touch shared/module-level state."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    client_a = _CapturingClient(result={"id": "user-a", "displayName": "Alice Smith"})
+    mcp_a = FastMCP(name="test-a")
+    users.register(mcp_a, lambda: client_a)
+
+    client_b = _CapturingClient(result={"id": "user-b", "displayName": "Bob Jones"})
+    mcp_b = FastMCP(name="test-b")
+    users.register(mcp_b, lambda: client_b)
+
+    result_a = await mcp_a.call_tool(
+        "graph_create_user", {**_BASE_CREATE_ARGS, "display_name": "Alice Smith"}
+    )
+    result_b = await mcp_b.call_tool(
+        "graph_create_user",
+        {
+            **_BASE_CREATE_ARGS,
+            "display_name": "Bob Jones",
+            "user_principal_name": "bob@contoso.com",
+            "mail_nickname": "bob",
+            "password": "Other-Pa55word!",
+        },
+    )
+
+    payload_a = json.loads(result_a[0][0].text)
+    payload_b = json.loads(result_b[0][0].text)
+
+    assert payload_a == {
+        "id": "user-a",
+        "displayName": "Alice Smith",
+        "passwordChangeRequiredAtNextSignIn": True,
+    }
+    assert payload_b == {
+        "id": "user-b",
+        "displayName": "Bob Jones",
+        "passwordChangeRequiredAtNextSignIn": True,
+    }
+    # each call's own body stayed its own, too.
+    assert client_a.bodies[0]["userPrincipalName"] == "alice@contoso.com"
+    assert client_b.bodies[0]["userPrincipalName"] == "bob@contoso.com"
+
+
 @pytest.mark.asyncio
 async def test_update_user_patches_only_the_given_profile_field():
     from graph_mcp.tools import users
