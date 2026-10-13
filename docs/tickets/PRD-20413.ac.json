@@ -136,8 +136,8 @@
       "Record the result of each of the 10 calls"
     ],
     "expect": "All 10 calls return the file's content successfully; zero calls fail with a malformed/invalid drive-id-style error",
-    "result": "untested",
-    "evidence": ""
+    "result": "blocked",
+    "evidence": "No live Entra/SharePoint tenant credentials available in this dev+test environment (gateway-mode service, sandbox has no Graph access token) -- cannot execute. Static evidence in lieu: src/graph_mcp/tools/sites.py's graph_read_site_file_text never emits a driveId/item id to the caller at any point in its success or error paths (verified by code review of the full function body, PRD-20413.md Tech design Data & API contract section); the structural guarantee this AC is actually about (one call, no id ever leaves the connector, see design doc's Open Questions) is covered by the green unit test test_read_site_file_text_happy_path_exact_site_match plus the full-chain TC1-TC14 unit suite (89 passed, 0 failed, uv run pytest). Needs: a consented test tenant with a SharePoint site + Permission Matrix.csv, run by whoever executes the dev+test leg with live credentials."
   },
   {
     "id": "TC16",
@@ -150,7 +150,7 @@
       "Inspect the returned error envelope"
     ],
     "expect": "error.code = not_text, with file_type reflecting the real MIME type Graph reports for that file (e.g. application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)",
-    "result": "untested",
-    "evidence": ""
+    "result": "blocked",
+    "evidence": "No live Entra/SharePoint tenant credentials available in this dev+test environment -- cannot execute against a real binary file. Static/simulated evidence in lieu: test_read_site_file_text_binary_content_returns_not_text (tests/test_tools.py) drives the exact same code path (src/graph_mcp/tools/sites.py graph_read_site_file_text's UnicodeDecodeError branch) with a simulated non-UTF-8 byte string and a simulated file facet mimeType, asserting error.code == 'not_text' and file_type echoed from the resolved item's file.mimeType -- green (uv run pytest, 89 passed). What this cannot prove locally: that Graph's real root:/{path}: response actually populates the file.mimeType facet with a sensible value for a real .xlsx/.docx at that tenant -- that part is specifically what TC16 exists to check live. Needs: a consented test tenant with a real binary Office file at a known site/path, run by whoever executes the dev+test leg with live credentials."
   }
 ]

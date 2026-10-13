@@ -5,3 +5,4 @@ Maps a code path / tool area to its accumulated-facts doc. Append-only; see `doc
 | Code path | Module doc |
 |---|---|
 | `src/graph_mcp/tools/users.py` | [users.md](users.md) ([中文](users.zh.md)) |
+| `src/graph_mcp/tools/sites.py` | [sites.md](sites.md) ([中文](sites.zh.md)) |
