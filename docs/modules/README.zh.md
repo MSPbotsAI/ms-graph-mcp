@@ -5,3 +5,4 @@
 | 代码路径 | 模块文档 |
 |---|---|
 | `src/graph_mcp/tools/users.py` | [users.zh.md](users.zh.md)（[English](users.md)） |
+| `src/graph_mcp/tools/groups.py` | [groups.zh.md](groups.zh.md)（[English](groups.md)） |
