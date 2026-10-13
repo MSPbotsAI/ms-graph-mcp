@@ -394,10 +394,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 f"/users/{user_id}",
                 params={
                     "$select": (
-                        "id,displayName,userPrincipalName,mail,accountEnabled,"
-                        "usageLocation,jobTitle,department,mobilePhone,businessPhones,"
-                        "officeLocation,streetAddress,city,state,postalCode,"
-                        "companyName,employeeHireDate,"
+                        "id,displayName,givenName,surname,userPrincipalName,mail,"
+                        "accountEnabled,usageLocation,jobTitle,department,mobilePhone,"
+                        "businessPhones,officeLocation,streetAddress,city,state,postalCode,"
+                        "companyName,employeeHireDate,employeeId,"
                         "provisionedPlans,assignedLicenses,"
                         "licenseAssignmentStates"
                     ),
@@ -442,6 +442,24 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         postal_code: Annotated[str | None, Field(description="Postal / ZIP code.")] = None,
         company_name: Annotated[str | None, Field(description="Company name.")] = None,
         employee_hire_date: Annotated[str | None, Field(description=_HIRE_DATE_DESC)] = None,
+        employee_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Employee ID to set. Mutually exclusive with "
+                    "clear_employee_id (PRD-20321)."
+                )
+            ),
+        ] = None,
+        clear_employee_id: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set True to clear employeeId to null. Mutually "
+                    "exclusive with employee_id (PRD-20321)."
+                )
+            ),
+        ] = False,
     ) -> str:
         """Update attributes on an existing Entra ID user.
 
@@ -453,7 +471,18 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         if client is None:
             return NO_TOKEN
 
+        if employee_id is not None and clear_employee_id:
+            return error_envelope(
+                "invalid_argument",
+                "Provide at most one of employee_id or clear_employee_id.",
+                False,
+            )
+
         body: dict = {}
+        if employee_id is not None:
+            body["employeeId"] = employee_id
+        elif clear_employee_id:
+            body["employeeId"] = None
         if account_enabled is not None:
             body["accountEnabled"] = account_enabled
         if usage_location is not None:
