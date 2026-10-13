@@ -1,0 +1,125 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given the Microsoft Graph connector's tool list is refreshed, When a caller lists its tools, Then graph_transfer_onedrive and graph_start_cloud_sync both appear and the total tool count is 41",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_tools_list_snapshot"
+    ]
+  },
+  {
+    "id": "TC2",
+    "ac": "AC2",
+    "text": "Given a source user with root items and an existing destination user, When graph_transfer_onedrive is called, Then it returns status=started and every item reports action=copy_started",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_transfer_onedrive_starts_copy_for_new_items"
+    ]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC3",
+    "text": "Given the destination folder already contains every source item at matching name and size, When graph_transfer_onedrive is called again, Then it returns status=completed, every item reports action=already_present, and zero copy calls are issued",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_transfer_onedrive_is_idempotent_when_all_items_already_present"
+    ]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC4",
+    "text": "Given the destination folder contains some items at a different size than the source, When graph_transfer_onedrive is called again, Then it returns status=in_progress and issues zero copy calls for those items",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_transfer_onedrive_does_not_recopy_items_mid_transfer"
+    ]
+  },
+  {
+    "id": "TC5",
+    "ac": "AC5",
+    "text": "Given a source user with no OneDrive provisioned, When graph_transfer_onedrive is called, Then it returns a drive_not_found error naming the source and makes no call for the destination",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_transfer_onedrive_reports_drive_not_found_for_source"
+    ]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC6",
+    "text": "Given a source user whose OneDrive root is empty, When graph_transfer_onedrive is called, Then it returns status=no_content and creates no destination folder",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_transfer_onedrive_reports_no_content_for_empty_source"
+    ]
+  },
+  {
+    "id": "TC7",
+    "ac": "AC7",
+    "text": "Given a destination user with no OneDrive provisioned, When graph_transfer_onedrive is called, Then it returns a drive_not_found error naming the destination and makes no change to the source",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_transfer_onedrive_reports_drive_not_found_for_destination"
+    ]
+  },
+  {
+    "id": "TC8",
+    "ac": "AC8",
+    "text": "Given a synced user (onPremisesSyncEnabled=true) and exactly one discoverable cloud-sync job, When graph_start_cloud_sync is called, Then it returns status=started with the resolved job_id and service_principal_id",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_start_cloud_sync_starts_job_for_synced_user"
+    ]
+  },
+  {
+    "id": "TC9",
+    "ac": "AC9",
+    "text": "Given a cloud-only user (onPremisesSyncEnabled=false), When graph_start_cloud_sync is called, Then it returns status=not_applicable and issues no /start call",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_start_cloud_sync_is_not_applicable_for_cloud_only_user"
+    ]
+  },
+  {
+    "id": "TC10",
+    "ac": "AC10",
+    "text": "Given a tenant with zero discoverable cloud-sync jobs, When graph_start_cloud_sync is called for a synced user, Then it returns no_sync_job_configured naming the on-prem Start-ADSyncSyncCycle alternative",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_start_cloud_sync_reports_no_sync_job_configured"
+    ]
+  },
+  {
+    "id": "TC11",
+    "ac": "AC11",
+    "text": "Given a tenant with two discoverable cloud-sync jobs, When graph_start_cloud_sync is called, Then it returns sync_job_ambiguous listing both candidate job ids",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_start_cloud_sync_reports_ambiguous_when_multiple_jobs"
+    ]
+  },
+  {
+    "id": "TC12",
+    "ac": "AC12",
+    "text": "Given two graph_start_cloud_sync calls made with two different fake clients standing in for two different tenants' tokens, When each call's service-principal/job discovery runs, Then neither call's resolved ids appear in the other call's request trace (no cross-tenant caching)",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_start_cloud_sync_discovery_is_not_cached_across_tenants"
+    ]
+  },
+  {
+    "id": "TC13",
+    "ac": "AC8",
+    "text": "Given an INT tenant with Azure AD Connect cloud sync actually configured and a real offboarding test user with OneDrive content, When both tools are run end-to-end against it, Then graph_transfer_onedrive's copy is observed to complete and graph_start_cloud_sync's job is observed to run",
+    "type": "manual",
+    "steps": [
+      "Obtain or confirm an INT tenant with Azure AD Connect cloud sync configured and admin consent granted for Synchronization.ReadWrite.All and Files.ReadWrite.All",
+      "Identify a disposable source test user with a few files in OneDrive root, and a destination test user",
+      "Call graph_transfer_onedrive(source, destination); wait; call it again to observe status transition from started/in_progress to completed",
+      "Call graph_start_cloud_sync(user_id=source) and observe the returned job_id; separately confirm (via the tenant's own sync status, outside this MCP) that a run was actually triggered"
+    ],
+    "expect": "graph_transfer_onedrive eventually reports status=completed with the destination folder containing all source root items at matching size; graph_start_cloud_sync reports status=started and the tenant's own sync history shows a run starting at or after the call",
+    "result": "untested",
+    "evidence": null
+  }
+]
