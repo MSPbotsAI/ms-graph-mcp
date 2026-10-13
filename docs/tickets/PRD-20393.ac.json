@@ -1,0 +1,115 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given a user who is a member of more groups than fit on one Graph page, When graph_list_user_groups is called repeatedly chaining next_page_token, Then every group is returned exactly once and the final call reports has_more=false and next_page_token=null",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken"]
+  },
+  {
+    "id": "TC2",
+    "ac": "AC2",
+    "text": "Given any group a user belongs to, When graph_list_user_groups is called, Then each group entry includes groupTypes, mailEnabled, and sync_source (on-premises|cloud)",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_user_groups_returns_group_type_mail_enabled_and_sync_source"]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC3",
+    "text": "Given a tenant with more groups than fit on one Graph page, When graph_list_groups is called repeatedly chaining next_page_token, Then every group is returned exactly once and the final call reports has_more=false",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_groups_paginates_with_skiptoken"]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC4",
+    "text": "Given a tenant with more users than fit on one Graph page, When graph_list_users is called repeatedly chaining next_page_token, Then every user is returned exactly once and the final call reports has_more=false",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_users_paginates_with_skiptoken"]
+  },
+  {
+    "id": "TC5",
+    "ac": "AC5",
+    "text": "Given employee_id/user_principal_name/display_name/given_name/surname are all omitted from a graph_update_user call, When the call runs, Then the PATCH body sent to Graph contains none of those keys",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_update_user_omitted_new_fields_are_not_sent"]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC6",
+    "text": "Given exactly one of the five new fields is passed as explicit null, When graph_update_user runs, Then the PATCH body sends that key as null and no other new key is present",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_update_user_explicit_null_clears_field"]
+  },
+  {
+    "id": "TC7",
+    "ac": "AC7",
+    "text": "Given user_principal_name is set to an address whose domain is not a verified tenant domain, When graph_update_user runs, Then it is rejected with an invalid_argument error and no PATCH call is made to Graph",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_update_user_rejects_unverified_upn_domain"]
+  },
+  {
+    "id": "TC8",
+    "ac": "AC8",
+    "text": "Given user_principal_name is set to an address on a verified tenant domain, When graph_update_user runs, Then the PATCH call to Graph includes userPrincipalName with the new value",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_update_user_allows_verified_upn_domain"]
+  },
+  {
+    "id": "TC9",
+    "ac": "AC9",
+    "text": "Given a user with an assigned manager, When graph_remove_manager is called, Then it issues DELETE /users/{id}/manager/$ref and returns status=removed",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_remove_manager_deletes_manager_ref"]
+  },
+  {
+    "id": "TC10",
+    "ac": "AC10",
+    "text": "Given a user with no manager assigned (Graph returns 404 on delete), When graph_remove_manager is called, Then it returns status=no_manager rather than an error envelope",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_remove_manager_is_idempotent_on_missing_manager"]
+  },
+  {
+    "id": "TC11",
+    "ac": "AC11",
+    "text": "Given graph_get_user is called with no select parameter, When the request is built, Then the $select sent to Graph includes proxyAddresses, identities, employeeId, and the onPremises* fields in addition to today's default set",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_get_user_default_select_includes_new_fields"]
+  },
+  {
+    "id": "TC12",
+    "ac": "AC12",
+    "text": "Given a select parameter naming a subset of fields, When graph_get_user is called, Then the $select sent to Graph is exactly those fields plus id",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_get_user_custom_select_narrows_fields"]
+  },
+  {
+    "id": "TC13",
+    "ac": "AC13",
+    "text": "Given the fake Graph client raises GraphError mid-pagination, When any of graph_list_user_groups/graph_list_groups/graph_list_users is called, Then it returns the existing error envelope instead of propagating an exception",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_tools_surface_graph_error_instead_of_raising"]
+  },
+  {
+    "id": "TC14",
+    "ac": "AC14",
+    "text": "Given graph_update_user is called with no attributes at all, including none of the five new ones, When the call runs, Then it is still rejected with the existing 'Provide at least one attribute to update' error",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_update_user_still_rejects_when_nothing_to_update"]
+  },
+  {
+    "id": "TC15",
+    "ac": "AC15",
+    "text": "Given a caller's access token is scoped to tenant A, When any of the six tools in this ticket is called with a user_id/group_id belonging to tenant B, Then Microsoft Graph itself returns not-found/unauthorized for the cross-tenant reference and no tenant-B data is returned",
+    "type": "manual",
+    "steps": [
+      "Obtain a valid Graph access token scoped to a real test tenant A (not the fake client)",
+      "Identify a real user_id/group_id that exists only in a separate tenant B",
+      "Call graph_get_user, graph_update_user, graph_remove_manager, graph_list_user_groups, graph_list_groups and graph_list_users against the tenant-B id, using the tenant-A token",
+      "Inspect each response"
+    ],
+    "expect": "Every call returns a 404/401-derived error envelope (not_found or unauthorized) from Graph; no tenant-B field value appears in any response",
+    "result": "untested",
+    "evidence": ""
+  }
+]
