@@ -265,7 +265,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         usage_location is required because it must be set before any license
         can be assigned to the user. Address, phone, company and hire date
-        can be set in the same call.
+        can be set in the same call. Every created account is configured to
+        require a password change at the user's next sign-in; this is not
+        configurable per call (PRD-20412).
         """
         client = client_factory()
         if client is None:
@@ -310,7 +312,18 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         try:
             result = await client.post("/users", body)
-            return dump_json_capped(result)
+            # Graph's own response never includes passwordProfile (its
+            # documented default property set omits it, and a follow-up
+            # $select read-back is reported unreliable), so a straight
+            # passthrough would give the caller zero evidence that the
+            # forced-password-change setting above was requested. A 201
+            # means Graph accepted the request body as-is, so echo our own
+            # intent back deterministically instead — same pattern
+            # graph_reset_password below already uses for its response
+            # (PRD-20412).
+            merged = dict(result) if isinstance(result, dict) else {"result": result}
+            merged["passwordChangeRequiredAtNextSignIn"] = True
+            return dump_json_capped(merged)
         except GraphError as e:
             return e.to_envelope()
 
@@ -394,10 +407,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 f"/users/{user_id}",
                 params={
                     "$select": (
-                        "id,displayName,userPrincipalName,mail,accountEnabled,"
-                        "usageLocation,jobTitle,department,mobilePhone,businessPhones,"
-                        "officeLocation,streetAddress,city,state,postalCode,"
-                        "companyName,employeeHireDate,"
+                        "id,displayName,givenName,surname,userPrincipalName,mail,"
+                        "accountEnabled,usageLocation,jobTitle,department,mobilePhone,"
+                        "businessPhones,officeLocation,streetAddress,city,state,postalCode,"
+                        "companyName,employeeHireDate,employeeId,"
                         "provisionedPlans,assignedLicenses,"
                         "licenseAssignmentStates"
                     ),
@@ -442,6 +455,24 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         postal_code: Annotated[str | None, Field(description="Postal / ZIP code.")] = None,
         company_name: Annotated[str | None, Field(description="Company name.")] = None,
         employee_hire_date: Annotated[str | None, Field(description=_HIRE_DATE_DESC)] = None,
+        employee_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Employee ID to set. Mutually exclusive with "
+                    "clear_employee_id (PRD-20321)."
+                )
+            ),
+        ] = None,
+        clear_employee_id: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set True to clear employeeId to null. Mutually "
+                    "exclusive with employee_id (PRD-20321)."
+                )
+            ),
+        ] = False,
     ) -> str:
         """Update attributes on an existing Entra ID user.
 
@@ -453,7 +484,18 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         if client is None:
             return NO_TOKEN
 
+        if employee_id is not None and clear_employee_id:
+            return error_envelope(
+                "invalid_argument",
+                "Provide at most one of employee_id or clear_employee_id.",
+                False,
+            )
+
         body: dict = {}
+        if employee_id is not None:
+            body["employeeId"] = employee_id
+        elif clear_employee_id:
+            body["employeeId"] = None
         if account_enabled is not None:
             body["accountEnabled"] = account_enabled
         if usage_location is not None:
