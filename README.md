@@ -93,6 +93,7 @@ Connect your MCP client with:
 | `graph_list_drive_items` | 列出文档库根目录或某个文件夹下的文件/文件夹（不递归） | `Sites.Read.All` |
 | `graph_get_file` | 获取文件元数据（名称/大小/MIME类型）+ 一个临时的预授权直接下载链接 | `Sites.Read.All` |
 | `graph_read_file_text` | 读取小体积纯文本文件（.txt/.md/.csv/.json等）的实际内容，超过200,000字节或非UTF-8可解码（即二进制Office文档）会拒绝并提示改用 downloadUrl | `Sites.Read.All` |
+| `graph_read_site_file_text` | 按站点名+文件名一次调用读取 SharePoint 文本文件，服务端完成 site→默认文档库→file→content 的解析，调用方全程不需要拿到/传入 driveId 或 item id——是 `graph_search_sites`→`graph_list_drive_items`→`graph_read_file_text` 三连调用链的单调用替代（PRD-20413，修复模型在中间步骤转述 driveId 偶发出错导致的"malformed drive id"失败）。限制同 `graph_read_file_text`；失败时返回结构化错误码 `site_not_found`/`site_ambiguous`/`file_not_found`/`file_empty`/`file_too_large`/`not_text` | `Sites.Read.All` |
 | `graph_write_file_text` | 整篇覆盖一个已存在的纯文本文件内容（非patch，必须传完整内容），目标文件当前MIME类型看着不像文本会拒绝写入 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_create_file_text` | 在指定路径新建一个纯文本文件；**如果该路径已存在文件会直接报错拒绝**，绝不会静默覆盖——要覆盖已有文件用 `graph_write_file_text` | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_delete_file` | 永久删除一个文件（进站点回收站，跟SharePoint网页里删除等效）；幂等，删一个已经不存在的item id也返回成功 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
