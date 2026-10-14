@@ -43,6 +43,131 @@ _MAX_WRITE_BYTES = 500_000
 _MAX_SITE_DRIVE_ENRICH = 5
 
 
+async def _resolve_site(
+    client: GraphClient, site_query: str, site_id: str | None
+) -> dict | str:
+    """Resolve a site to {"id","displayName","webUrl"}, or return an
+    error_envelope string. site_id wins when both are given (PRD-20413 AC5).
+    """
+    if site_id:
+        try:
+            site = await client.get(
+                f"/sites/{site_id}", params={"$select": "id,name,displayName,webUrl"}
+            )
+        except GraphError:
+            return error_envelope(
+                "site_not_found",
+                f'No site found for site_id "{site_id}".',
+                False,
+                extra={"site_id": site_id},
+            )
+        return {
+            "id": site.get("id"),
+            "displayName": site.get("displayName"),
+            "webUrl": site.get("webUrl"),
+        }
+
+    try:
+        result = await client.get(
+            "/sites", params={"search": site_query, "$select": "id,name,displayName,webUrl"}
+        )
+    except GraphError as e:
+        return e.to_envelope()
+    sites = result.get("value", []) if isinstance(result, dict) else []
+    if not sites:
+        return error_envelope(
+            "site_not_found",
+            f'No site found matching "{site_query}".',
+            False,
+            extra={"searched_for": site_query},
+        )
+    exact = [s for s in sites if (s.get("displayName") or "").casefold() == site_query.casefold()]
+    if len(exact) == 1:
+        chosen = exact[0]
+    elif len(exact) == 0 and len(sites) == 1:
+        chosen = sites[0]
+    else:
+        candidates = [
+            {"id": s.get("id"), "displayName": s.get("displayName"), "webUrl": s.get("webUrl")}
+            for s in sites
+        ]
+        return error_envelope(
+            "site_ambiguous",
+            f'Multiple sites match "{site_query}" and none is an exact name match.',
+            False,
+            extra={"candidates": candidates},
+        )
+    return {
+        "id": chosen.get("id"),
+        "displayName": chosen.get("displayName"),
+        "webUrl": chosen.get("webUrl"),
+    }
+
+
+async def _resolve_drive(client: GraphClient, site_id: str) -> dict | str:
+    """Resolve a site's default document library. Any failure here
+    (including "no default library") folds into file_not_found per the
+    PRD-20413 design's Open Questions decision — the ticket's own error
+    table has no separate code for "this site has no library at all".
+    """
+    try:
+        drive = await client.get(f"/sites/{site_id}/drive", params={"$select": "id,name"})
+    except GraphError:
+        return error_envelope(
+            "file_not_found",
+            "Site has no default document library.",
+            False,
+            extra={"reason": "site has no default document library"},
+        )
+    return {"id": drive.get("id"), "name": drive.get("name")}
+
+
+async def _resolve_file(
+    client: GraphClient, drive_id: str, file_name: str, folder_path: str | None
+) -> dict | str:
+    """Resolve file_name (optionally under folder_path) to a drive item via
+    Graph's root:/{path}: addressing (same mechanism graph_create_file_text
+    already uses). 404 and folder-instead-of-file both fold into
+    file_not_found, per the ticket's four-code error table.
+    """
+    path = f"{folder_path.strip('/')}/{file_name}" if folder_path else file_name
+    try:
+        item = await client.get(
+            f"/drives/{drive_id}/root:/{path}:",
+            params={"$select": "id,name,size,file,folder,lastModifiedDateTime"},
+        )
+    except GraphError as e:
+        if e.status_code != 404:
+            return e.to_envelope()
+        listing_path = (
+            f"/drives/{drive_id}/root:/{folder_path.strip('/')}:/children"
+            if folder_path
+            else f"/drives/{drive_id}/root/children"
+        )
+        try:
+            listing = await client.get(listing_path, params={"$select": "name"})
+            entries = listing.get("value", []) if isinstance(listing, dict) else []
+            names = [entry.get("name") for entry in entries]
+        except GraphError:
+            # The folder itself doesn't exist either — an empty list is the
+            # honest answer, not a second error for the caller to handle.
+            names = []
+        return error_envelope(
+            "file_not_found",
+            f'No file named "{file_name}" found.',
+            False,
+            extra={"files_in_folder": names},
+        )
+    if item.get("folder") is not None:
+        return error_envelope(
+            "file_not_found",
+            f'"{path}" is a folder, not a file.',
+            False,
+            extra={"reason": "path is a folder, not a file"},
+        )
+    return item
+
+
 def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> None:
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
@@ -201,6 +326,109 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 False,
             )
         return dump_json_capped({"name": meta.get("name"), "size": size, "content": text})
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+    async def graph_read_site_file_text(
+        site_query: Annotated[
+            str,
+            Field(
+                description='Site name or keyword, e.g. "permission matrix". Tries an '
+                "exact, case-insensitive displayName match first; falls back to the "
+                "single keyword-search hit if there is exactly one. Still required "
+                "even when site_id is given (site_id then wins for resolution)."
+            ),
+        ],
+        file_name: Annotated[
+            str, Field(description='File name, e.g. "Permission Matrix.csv" (case-insensitive).')
+        ],
+        folder_path: Annotated[
+            str | None,
+            Field(
+                description='Folder path inside the document library, e.g. "HR/Matrix". '
+                "Omit to look in the library root."
+            ),
+        ] = None,
+        site_id: Annotated[
+            str | None,
+            Field(description="Site id, if already known — skips the site search entirely."),
+        ] = None,
+    ) -> str:
+        """Read a SharePoint text file in ONE call, by site + file name —
+        no driveId or item id needed.
+
+        Resolves site -> drive -> file -> content server-side, so no id is
+        copied through the model. Same limits as graph_read_file_text
+        (<=200,000 bytes, UTF-8 only). Errors: site_not_found,
+        site_ambiguous, file_not_found, file_empty, file_too_large,
+        not_text — each with extra structured context.
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        site = await _resolve_site(client, site_query, site_id)
+        if isinstance(site, str):
+            return site
+
+        drive = await _resolve_drive(client, site["id"])
+        if isinstance(drive, str):
+            return drive
+
+        file_item = await _resolve_file(client, drive["id"], file_name, folder_path)
+        if isinstance(file_item, str):
+            return file_item
+
+        size = file_item.get("size")
+        if isinstance(size, int) and size == 0:
+            return error_envelope(
+                "file_empty",
+                f'"{file_item.get("name")}" exists but is empty (0 bytes).',
+                False,
+                extra={
+                    "file": {
+                        "name": file_item.get("name"),
+                        "lastModifiedDateTime": file_item.get("lastModifiedDateTime"),
+                    }
+                },
+            )
+        if isinstance(size, int) and size > _MAX_READ_BYTES:
+            return error_envelope(
+                "file_too_large",
+                f"File is {size:,} bytes, over this tool's {_MAX_READ_BYTES:,}-byte "
+                "text-read limit.",
+                False,
+                extra={"size": size, "limit": _MAX_READ_BYTES},
+            )
+
+        item_id = file_item.get("id")
+        try:
+            raw = await client.get_content(f"/drives/{drive['id']}/items/{item_id}/content")
+        except GraphError as e:
+            return e.to_envelope()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            file_type = (file_item.get("file") or {}).get("mimeType")
+            return error_envelope(
+                "not_text",
+                "File content is not valid UTF-8 text — this is a binary file "
+                "(e.g. .docx/.xlsx/.pdf), which this tool cannot read.",
+                False,
+                extra={"file_type": file_type},
+            )
+        return dump_json_capped(
+            {
+                "site": site,
+                "drive": drive,
+                "file": {
+                    "id": item_id,
+                    "name": file_item.get("name"),
+                    "size": size,
+                    "lastModifiedDateTime": file_item.get("lastModifiedDateTime"),
+                },
+                "content": text,
+            }
+        )
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
     async def graph_write_file_text(

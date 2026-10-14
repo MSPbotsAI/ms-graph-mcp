@@ -73,5 +73,16 @@ def _truncate_list(items: list, max_chars: int, wrap_key: str) -> str:
     return _compact({wrap_key: items[:lo], "truncated": True, "original_count": len(items)})
 
 
-def error_envelope(code: str, message: str, retryable: bool) -> str:
-    return _compact({"error": {"code": code, "message": message, "retryable": retryable}})
+def error_envelope(
+    code: str, message: str, retryable: bool, extra: dict[str, Any] | None = None
+) -> str:
+    """Additive, backward-compatible: when `extra` is omitted (every call
+    site before PRD-20413), the output is byte-for-byte unchanged. When
+    given, its keys are merged into the error object alongside code/
+    message/retryable so a caller can branch on structured context
+    (candidate lists, sibling file names, etc.) without parsing `message`.
+    """
+    error: dict[str, Any] = {"code": code, "message": message, "retryable": retryable}
+    if extra:
+        error.update(extra)
+    return _compact({"error": error})

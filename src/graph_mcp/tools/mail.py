@@ -31,6 +31,7 @@ import csv
 import datetime as dt
 import io
 import json
+import mimetypes
 import re
 from collections.abc import Callable
 from typing import Annotated, Literal
@@ -101,8 +102,30 @@ _MAX_ATTACHMENTS = 5
 _ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
 
 
+_DATA_URI_PREFIX = re.compile(r"^data:[^,]*;base64,", re.IGNORECASE)
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _normalize_base64(value: str) -> str:
+    """Coerce the base64 variants agents actually produce into standard base64.
+
+    Agents encode with whatever is at hand: `base64` CLI / MIME output wrapped
+    every 76 chars, a `data:<type>;base64,` URI, the URL-safe alphabet, or
+    dropped `=` padding. All of these are unambiguous, so accept them instead
+    of failing the send (PRD-20416). Anything still invalid after this is
+    genuinely corrupt and is rejected by the strict decode.
+    """
+    value = _DATA_URI_PREFIX.sub("", value.strip(), count=1)
+    value = _WHITESPACE.sub("", value).replace("-", "+").replace("_", "/")
+    return value + "=" * (-len(value) % 4)
+
+
 def _build_attachments(attachments: list[dict]) -> list[dict] | str:
     """Validate inline attachments and map them to Graph fileAttachment dicts.
+
+    Each attachment carries its bytes as either content_base64 or, for text
+    files (HTML, CSV, TXT, ...), content_text — raw text this server encodes
+    as UTF-8, so the agent never has to base64-encode a file in its context.
 
     Returns the list, or an invalid_argument envelope string — checked before
     any request goes out, so a bad attachment never sends a mail without it.
@@ -118,20 +141,41 @@ def _build_attachments(attachments: list[dict]) -> list[dict] | str:
     for i, att in enumerate(attachments):
         if not isinstance(att, dict):
             return error_envelope("invalid_argument", f"attachments[{i}] must be an object", False)
-        for key in ("filename", "content_base64"):
-            if not att.get(key):
-                return error_envelope(
-                    "invalid_argument", f"attachments[{i}] missing required field '{key}'", False
-                )
+        if not att.get("filename"):
+            return error_envelope(
+                "invalid_argument", f"attachments[{i}] missing required field 'filename'", False
+            )
         filename = att["filename"]
-        try:
-            size = len(base64.b64decode(att["content_base64"], validate=True))
-        except (binascii.Error, ValueError, TypeError) as e:
+        has_b64 = bool(att.get("content_base64"))
+        has_text = isinstance(att.get("content_text"), str) and att["content_text"] != ""
+        if has_b64 == has_text:
             return error_envelope(
                 "invalid_argument",
-                f"attachments[{i}] ('{filename}') is not valid base64: {e}",
+                f"attachments[{i}] ('{filename}') needs exactly one of 'content_base64' "
+                "or 'content_text'",
                 False,
             )
+        if has_text:
+            raw = att["content_text"].encode("utf-8")
+            content_b64 = base64.b64encode(raw).decode("ascii")
+        else:
+            if not isinstance(att["content_base64"], str):
+                return error_envelope(
+                    "invalid_argument",
+                    f"attachments[{i}] ('{filename}') content_base64 must be a string",
+                    False,
+                )
+            content_b64 = _normalize_base64(att["content_base64"])
+            try:
+                raw = base64.b64decode(content_b64, validate=True)
+            except (binascii.Error, ValueError) as e:
+                return error_envelope(
+                    "invalid_argument",
+                    f"attachments[{i}] ('{filename}') is not valid base64: {e}. "
+                    "For text files (HTML, CSV, TXT) pass the raw text as content_text instead.",
+                    False,
+                )
+        size = len(raw)
         if size > _MAX_ATTACHMENT_BYTES:
             return error_envelope(
                 "invalid_argument",
@@ -145,9 +189,10 @@ def _build_attachments(attachments: list[dict]) -> list[dict] | str:
             {
                 "@odata.type": "#microsoft.graph.fileAttachment",
                 "name": filename,
-                "contentType": att.get("content_type") or "application/octet-stream",
-                # Graph takes base64 as-is; no need to re-encode the decoded bytes.
-                "contentBytes": att["content_base64"],
+                "contentType": att.get("content_type")
+                or mimetypes.guess_type(filename)[0]
+                or "application/octet-stream",
+                "contentBytes": content_b64,
             }
         )
     if total > _MAX_TOTAL_ATTACHMENT_BYTES:
@@ -357,7 +402,7 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         attachments: Annotated[
             list[dict] | None,
             Field(
-                description='Optional file attachments, up to 5: [{"filename": "quote.pdf", "content_base64": "<standard base64>", "content_type": "application/pdf"}]. content_type defaults to application/octet-stream. Max 500 KB per file and 700 KB total, decoded. If any attachment is invalid nothing is sent.'
+                description='Optional file attachments, up to 5. Each item has "filename" plus exactly one of: "content_text" — the raw text of a text file (HTML, CSV, TXT, JSON, Markdown), encoded server-side, preferred for text files; or "content_base64" — the file bytes as base64, for binary files (PDF, images, Office). e.g. [{"filename": "report.html", "content_text": "<html>...</html>"}, {"filename": "quote.pdf", "content_base64": "JVBERi0x...", "content_type": "application/pdf"}]. content_type defaults to a guess from the filename extension. Max 500 KB per file and 700 KB total, decoded. If any attachment is invalid nothing is sent.'
             ),
         ] = None,
     ) -> str:

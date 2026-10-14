@@ -86,13 +86,14 @@ Connect your MCP client with:
 | `graph_assign_license` | 为用户分配和/或移除指定 SKU 许可（Graph 的 assignLicense 接口一次调用同时支持增删，两者合并进这一个 tool） | `User.ReadWrite.All` |
 | `graph_reprocess_license` | 对用户重跑组许可分配（`licenseAssignmentStates` 报错/卡住时用，例如补了 usage_location 或腾出库存之后），不改变应有的许可 | `User.ReadWrite.All`（最小权限 `LicenseAssignment.ReadWrite.All`） |
 | `graph_list_domains` | 列出租户域名（默认只回已验证的，`isDefault` 标出默认域），入职时选 UPN / 邮箱域 | `Domain.Read.All` 或 `Directory.Read.All`（委派版已申请 `Directory.Read.All`；app-only 需客户另授） |
-| `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC、HTML 正文及内联附件（base64，≤500 KB/文件，合计 ≤700 KB，最多 5 个） | `Mail.Send`；带 `sender_id`（代他人/共享邮箱发信）另需 `Mail.Send.Shared` |
+| `graph_send_mail` | 以指定用户身份发送邮件，支持 To / CC / BCC、HTML 正文及内联附件（文本文件用 `content_text` 直接传原文，二进制文件用 `content_base64`，换行 / `data:` 前缀 / URL-safe / 缺 padding 都兼容；≤500 KB/文件，合计 ≤700 KB，最多 5 个） | `Mail.Send`；带 `sender_id`（代他人/共享邮箱发信）另需 `Mail.Send.Shared` |
 | `graph_list_messages` | 列出/搜索某个邮箱的邮件，只回元数据 + `bodyPreview`，不带正文；默认收件箱、按收件时间倒序，可按发件人/会话/时间窗/未读/有无附件过滤，也可 `search` 全文检索。`folder=null` 跨全部文件夹，配合 `conversation_id` 才能看到整条线程（含自己发出去的回复）。只取第一页，返回带 `has_more` | `Mail.Read`（读别人的邮箱：app-only 权限，或委派下该邮箱已共享给调用者，见 `Mail.Read.Shared`） |
 | `graph_get_message` | 读单封邮件全文（含正文）。默认让 Exchange 把正文压成纯文本（`Prefer: outlook.body-content-type`），比 HTML 省好几倍 token；正文超过 15,000 字符会截断并标 `truncated`/`original_length`。`include_attachments=true` 另跑一次附件列表，只回名称/类型/大小，**绝不回 `contentBytes`** | `Mail.Read`（同上） |
 | `graph_search_sites` | 按名称/关键词搜索 SharePoint 站点，结果自动带出每个站点默认文档库的 driveId（最多补前5条） | `Sites.Read.All` |
 | `graph_list_drive_items` | 列出文档库根目录或某个文件夹下的文件/文件夹（不递归） | `Sites.Read.All` |
 | `graph_get_file` | 获取文件元数据（名称/大小/MIME类型）+ 一个临时的预授权直接下载链接 | `Sites.Read.All` |
 | `graph_read_file_text` | 读取小体积纯文本文件（.txt/.md/.csv/.json等）的实际内容，超过200,000字节或非UTF-8可解码（即二进制Office文档）会拒绝并提示改用 downloadUrl | `Sites.Read.All` |
+| `graph_read_site_file_text` | 按站点名+文件名一次调用读取 SharePoint 文本文件，服务端完成 site→默认文档库→file→content 的解析，调用方全程不需要拿到/传入 driveId 或 item id——是 `graph_search_sites`→`graph_list_drive_items`→`graph_read_file_text` 三连调用链的单调用替代（PRD-20413，修复模型在中间步骤转述 driveId 偶发出错导致的"malformed drive id"失败）。限制同 `graph_read_file_text`；失败时返回结构化错误码 `site_not_found`/`site_ambiguous`/`file_not_found`/`file_empty`/`file_too_large`/`not_text` | `Sites.Read.All` |
 | `graph_write_file_text` | 整篇覆盖一个已存在的纯文本文件内容（非patch，必须传完整内容），目标文件当前MIME类型看着不像文本会拒绝写入 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_create_file_text` | 在指定路径新建一个纯文本文件；**如果该路径已存在文件会直接报错拒绝**，绝不会静默覆盖——要覆盖已有文件用 `graph_write_file_text` | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_delete_file` | 永久删除一个文件（进站点回收站，跟SharePoint网页里删除等效）；幂等，删一个已经不存在的item id也返回成功 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
