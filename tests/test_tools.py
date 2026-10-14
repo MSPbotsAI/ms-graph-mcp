@@ -59,6 +59,8 @@ EXPECTED_TOOLS = {
     "graph_get_user_availability": {"user_ids", "start_datetime", "end_datetime"},
     "graph_create_calendar_event": {"subject", "start_datetime", "end_datetime"},
     "graph_cancel_calendar_event": {"event_id"},
+    "graph_transfer_onedrive": {"source_user_id", "destination_user_id"},
+    "graph_start_cloud_sync": {"user_id"},
 }
 
 # Tools that are not plain read-only queries (writes / mutations).
@@ -80,6 +82,8 @@ _NON_READ_ONLY = {
     "graph_remove_managed_device",
     "graph_create_calendar_event",
     "graph_cancel_calendar_event",
+    "graph_transfer_onedrive",
+    "graph_start_cloud_sync",
 }
 
 
@@ -126,7 +130,12 @@ async def test_tools_list_snapshot():
     # site -> drive -> file chain into one call so the model never has to
     # copy a driveId between calls — the id-copying is what caused the
     # reopened PRD-20211 intermittent "malformed drive id" failure.
-    assert len(names) <= 39, "tool count should stay within SOP's <=20 guideline (+19 justified)"
+    # +2 for the offboarding transfer/sync pair (PRD-20422):
+    # graph_transfer_onedrive and graph_start_cloud_sync are disjoint Graph
+    # operations (drive copy vs. synchronization-job start) with no shared
+    # mode flag; deferred from PRD-20393 items 7-8 pending Ginko
+    # confirmation of production behavior.
+    assert len(names) <= 41, "tool count should stay within SOP's <=20 guideline (+21 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -2214,3 +2223,346 @@ async def test_read_site_file_text_only_issues_get_requests():
     await _read_site_file(client)
 
     assert client.methods and all(m == "GET" for m in client.methods)
+
+
+# --- PRD-20422: graph_transfer_onedrive / graph_start_cloud_sync ---------
+
+
+class _RoutedClient:
+    """GraphClient stand-in for offboarding.py's multi-endpoint resolve/
+    list/act flows: GET responses are keyed by exact path (a dict to
+    return, or a GraphError to raise); POST responses are keyed by exact
+    path too, defaulting to {} when the test doesn't care about the body.
+    Every call is recorded for assertions on call order/count.
+    """
+
+    def __init__(self, get_responses: dict, post_responses: dict | None = None):
+        self._get_responses = dict(get_responses)
+        self._post_responses = dict(post_responses or {})
+        self.get_calls: list[tuple[str, dict]] = []
+        self.post_calls: list[tuple[str, dict]] = []
+
+    async def get(self, path, params=None, extra_headers=None):
+        self.get_calls.append((path, params or {}))
+        resp = self._get_responses[path]
+        if isinstance(resp, GraphError):
+            raise resp
+        return resp
+
+    async def post(self, path, body=None, extra_headers=None):
+        self.post_calls.append((path, body or {}))
+        resp = self._post_responses.get(path, {})
+        if isinstance(resp, GraphError):
+            raise resp
+        return resp
+
+
+def _offboarding_mcp(client):
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import offboarding
+
+    mcp = FastMCP(name="test")
+    offboarding.register(mcp, lambda: client)
+    return mcp
+
+
+async def _call_offboarding(client, tool_name, **args):
+    mcp = _offboarding_mcp(client)
+    result = await mcp.call_tool(tool_name, args)
+    return json.loads(result[0][0].text)
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_starts_copy_for_new_items():
+    """AC2/TC2: a fresh transfer with no destination overlap returns
+    status=started and issues one copy per source item."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u-src/drive": {"id": "d-src"},
+            "/users/u-dst/drive": {"id": "d-dst"},
+            "/drives/d-src/root/children": {
+                "value": [
+                    {"id": "item1", "name": "a.txt", "size": 10},
+                    {"id": "item2", "name": "b.txt", "size": 20},
+                ]
+            },
+            "/drives/d-dst/root:/offboarded-u-src:": GraphError(404, "not found"),
+            "/drives/d-dst/items/folder1/children": {"value": []},
+        },
+        post_responses={
+            "/drives/d-dst/root/children": {"id": "folder1", "name": "offboarded-u-src"},
+        },
+    )
+    payload = await _call_offboarding(
+        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
+    )
+
+    assert payload["status"] == "started"
+    assert payload["destination_folder"] == {"id": "folder1", "name": "offboarded-u-src"}
+    assert payload["items"] == [
+        {"name": "a.txt", "size": 10, "action": "copy_started"},
+        {"name": "b.txt", "size": 20, "action": "copy_started"},
+    ]
+    copy_paths = [p for p, _ in client.post_calls if p.endswith("/copy")]
+    assert copy_paths == [
+        "/drives/d-src/items/item1/copy",
+        "/drives/d-src/items/item2/copy",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_is_idempotent_when_all_items_already_present():
+    """AC3/TC3: a repeat call where every item already matches name+size
+    returns status=completed and issues zero copy calls."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u-src/drive": {"id": "d-src"},
+            "/users/u-dst/drive": {"id": "d-dst"},
+            "/drives/d-src/root/children": {
+                "value": [{"id": "item1", "name": "a.txt", "size": 10}]
+            },
+            "/drives/d-dst/root:/offboarded-u-src:": {"id": "folder1", "name": "offboarded-u-src"},
+            "/drives/d-dst/items/folder1/children": {
+                "value": [{"name": "a.txt", "size": 10}]
+            },
+        },
+    )
+    payload = await _call_offboarding(
+        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
+    )
+
+    assert payload["status"] == "completed"
+    assert payload["items"] == [{"name": "a.txt", "size": 10, "action": "already_present"}]
+    assert client.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_does_not_recopy_items_mid_transfer():
+    """AC4/TC4: a destination item present at a different size is still
+    mid-copy -- status=in_progress, no duplicate copy issued for it."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u-src/drive": {"id": "d-src"},
+            "/users/u-dst/drive": {"id": "d-dst"},
+            "/drives/d-src/root/children": {
+                "value": [{"id": "item1", "name": "a.txt", "size": 10}]
+            },
+            "/drives/d-dst/root:/offboarded-u-src:": {"id": "folder1", "name": "offboarded-u-src"},
+            "/drives/d-dst/items/folder1/children": {
+                "value": [{"name": "a.txt", "size": 5}]
+            },
+        },
+    )
+    payload = await _call_offboarding(
+        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
+    )
+
+    assert payload["status"] == "in_progress"
+    assert payload["items"] == [{"name": "a.txt", "size": 10, "action": "in_progress"}]
+    assert client.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_reports_drive_not_found_for_source():
+    """AC5/TC5: a source with no OneDrive returns drive_not_found naming
+    the source and never calls the destination."""
+    client = _RoutedClient(
+        get_responses={"/users/u-src/drive": GraphError(404, "not found")},
+    )
+    payload = await _call_offboarding(
+        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
+    )
+
+    assert payload["error"]["code"] == "drive_not_found"
+    assert payload["error"]["role"] == "source"
+    assert client.get_calls == [("/users/u-src/drive", {"$select": "id,driveType"})]
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_reports_no_content_for_empty_source():
+    """AC6/TC6: an empty source root returns status=no_content and creates
+    no destination folder."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u-src/drive": {"id": "d-src"},
+            "/users/u-dst/drive": {"id": "d-dst"},
+            "/drives/d-src/root/children": {"value": []},
+        },
+    )
+    payload = await _call_offboarding(
+        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
+    )
+
+    assert payload["status"] == "no_content"
+    assert payload["items"] == []
+    assert client.post_calls == []
+    assert not any("root:/" in p for p, _ in client.get_calls)
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_reports_drive_not_found_for_destination():
+    """AC7/TC7: a destination with no OneDrive returns drive_not_found
+    naming the destination and never lists the source's content."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u-src/drive": {"id": "d-src"},
+            "/users/u-dst/drive": GraphError(404, "not found"),
+        },
+    )
+    payload = await _call_offboarding(
+        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
+    )
+
+    assert payload["error"]["code"] == "drive_not_found"
+    assert payload["error"]["role"] == "destination"
+    assert not any(p == "/drives/d-src/root/children" for p, _ in client.get_calls)
+
+
+@pytest.mark.asyncio
+async def test_start_cloud_sync_starts_job_for_synced_user():
+    """AC8/TC8: a synced user with exactly one discoverable cloud-sync job
+    returns status=started with the resolved job_id/service_principal_id."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u1": {"onPremisesSyncEnabled": True},
+            "/servicePrincipals": {
+                "value": [
+                    {"id": "sp1", "homepage": "https://x/AD2AADProvisioningAgent"},
+                ]
+            },
+            "/servicePrincipals/sp1/synchronization/jobs": {
+                "value": [
+                    {
+                        "id": "job1",
+                        "templateId": "AD2AADProvisioning",
+                        "schedule": {"state": "Active"},
+                    }
+                ]
+            },
+        },
+    )
+    payload = await _call_offboarding(client, "graph_start_cloud_sync", user_id="u1")
+
+    assert payload["status"] == "started"
+    assert payload["service_principal_id"] == "sp1"
+    assert payload["job_id"] == "job1"
+    assert client.post_calls == [
+        ("/servicePrincipals/sp1/synchronization/jobs/job1/start", {})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_start_cloud_sync_is_not_applicable_for_cloud_only_user():
+    """AC9/TC9: a cloud-only user (onPremisesSyncEnabled=false) returns
+    status=not_applicable and issues no further calls."""
+    client = _RoutedClient(get_responses={"/users/u1": {"onPremisesSyncEnabled": False}})
+    payload = await _call_offboarding(client, "graph_start_cloud_sync", user_id="u1")
+
+    assert payload["status"] == "not_applicable"
+    assert "reason" in payload
+    assert client.get_calls == [("/users/u1", {"$select": "onPremisesSyncEnabled"})]
+    assert client.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_cloud_sync_reports_no_sync_job_configured():
+    """AC10/TC10: zero discoverable cloud-sync service principals returns
+    no_sync_job_configured naming the on-prem Start-ADSyncSyncCycle
+    alternative."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u1": {"onPremisesSyncEnabled": True},
+            "/servicePrincipals": {"value": []},
+        },
+    )
+    payload = await _call_offboarding(client, "graph_start_cloud_sync", user_id="u1")
+
+    assert payload["error"]["code"] == "no_sync_job_configured"
+    assert "Start-ADSyncSyncCycle" in payload["error"]["message"]
+    assert client.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_cloud_sync_reports_ambiguous_when_multiple_jobs():
+    """AC11/TC11: two discoverable cloud-sync jobs on the same service
+    principal returns sync_job_ambiguous listing both candidate ids."""
+    client = _RoutedClient(
+        get_responses={
+            "/users/u1": {"onPremisesSyncEnabled": True},
+            "/servicePrincipals": {
+                "value": [{"id": "sp1", "homepage": "https://x/AD2AADProvisioningAgent"}]
+            },
+            "/servicePrincipals/sp1/synchronization/jobs": {
+                "value": [
+                    {
+                        "id": "job1",
+                        "templateId": "AD2AADProvisioning",
+                        "schedule": {"state": "Active"},
+                    },
+                    {
+                        "id": "job2",
+                        "templateId": "AD2AADProvisioning",
+                        "schedule": {"state": "Active"},
+                    },
+                ]
+            },
+        },
+    )
+    payload = await _call_offboarding(client, "graph_start_cloud_sync", user_id="u1")
+
+    assert payload["error"]["code"] == "sync_job_ambiguous"
+    assert payload["error"]["candidates"] == ["job1", "job2"]
+    assert client.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_cloud_sync_discovery_is_not_cached_across_tenants():
+    """AC12/TC12: two calls against two different fake clients (standing in
+    for two tenants' tokens) each resolve their own ids -- neither call's
+    sp/job id leaks into the other's request trace, since nothing is cached
+    at module/process scope."""
+    client_a = _RoutedClient(
+        get_responses={
+            "/users/u1": {"onPremisesSyncEnabled": True},
+            "/servicePrincipals": {
+                "value": [{"id": "spA", "homepage": "https://x/AD2AADProvisioningAgent"}]
+            },
+            "/servicePrincipals/spA/synchronization/jobs": {
+                "value": [
+                    {
+                        "id": "jobA",
+                        "templateId": "AD2AADProvisioning",
+                        "schedule": {"state": "Active"},
+                    }
+                ]
+            },
+        },
+    )
+    client_b = _RoutedClient(
+        get_responses={
+            "/users/u1": {"onPremisesSyncEnabled": True},
+            "/servicePrincipals": {
+                "value": [{"id": "spB", "homepage": "https://x/AD2AADProvisioningAgent"}]
+            },
+            "/servicePrincipals/spB/synchronization/jobs": {
+                "value": [
+                    {
+                        "id": "jobB",
+                        "templateId": "AD2AADProvisioning",
+                        "schedule": {"state": "Active"},
+                    }
+                ]
+            },
+        },
+    )
+
+    payload_a = await _call_offboarding(client_a, "graph_start_cloud_sync", user_id="u1")
+    payload_b = await _call_offboarding(client_b, "graph_start_cloud_sync", user_id="u1")
+
+    assert payload_a["service_principal_id"] == "spA"
+    assert payload_a["job_id"] == "jobA"
+    assert payload_b["service_principal_id"] == "spB"
+    assert payload_b["job_id"] == "jobB"
+    assert not any("spB" in p or "jobB" in p for p, _ in client_a.get_calls + client_a.post_calls)
+    assert not any("spA" in p or "jobA" in p for p, _ in client_b.get_calls + client_b.post_calls)

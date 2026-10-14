@@ -6,7 +6,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_tools_list_snapshot"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_tools_list_snapshot PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC2",
@@ -15,7 +17,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_transfer_onedrive_starts_copy_for_new_items"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_transfer_onedrive_starts_copy_for_new_items PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC3",
@@ -24,7 +28,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_transfer_onedrive_is_idempotent_when_all_items_already_present"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_transfer_onedrive_is_idempotent_when_all_items_already_present PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC4",
@@ -33,7 +39,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_transfer_onedrive_does_not_recopy_items_mid_transfer"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_transfer_onedrive_does_not_recopy_items_mid_transfer PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC5",
@@ -42,7 +50,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_transfer_onedrive_reports_drive_not_found_for_source"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_transfer_onedrive_reports_drive_not_found_for_source PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC6",
@@ -51,7 +61,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_transfer_onedrive_reports_no_content_for_empty_source"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_transfer_onedrive_reports_no_content_for_empty_source PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC7",
@@ -60,7 +72,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_transfer_onedrive_reports_drive_not_found_for_destination"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_transfer_onedrive_reports_drive_not_found_for_destination PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC8",
@@ -69,7 +83,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_start_cloud_sync_starts_job_for_synced_user"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_start_cloud_sync_starts_job_for_synced_user PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC9",
@@ -78,7 +94,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_start_cloud_sync_is_not_applicable_for_cloud_only_user"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_start_cloud_sync_is_not_applicable_for_cloud_only_user PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC10",
@@ -87,7 +105,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_start_cloud_sync_reports_no_sync_job_configured"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_start_cloud_sync_reports_no_sync_job_configured PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC11",
@@ -96,7 +116,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_start_cloud_sync_reports_ambiguous_when_multiple_jobs"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_start_cloud_sync_reports_ambiguous_when_multiple_jobs PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC12",
@@ -105,7 +127,9 @@
     "type": "auto",
     "tests": [
       "tests/test_tools.py::test_start_cloud_sync_discovery_is_not_cached_across_tenants"
-    ]
+    ],
+    "result": "pass",
+    "evidence": "uv run pytest tests/test_tools.py -k \"transfer_onedrive or cloud_sync or tools_list_snapshot\" -v -> tests/test_tools.py::test_start_cloud_sync_discovery_is_not_cached_across_tenants PASSED (full suite: uv run pytest -q -> 133 passed, 0 failed; baseline was 122 passed before this ticket, diff shows 0 regressions)"
   },
   {
     "id": "TC13",
