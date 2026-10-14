@@ -29,7 +29,9 @@ _USER_LIST_SELECT = (
 # graph_get_user's default $select (PRD-20393: widened with proxyAddresses,
 # identities and the on-premises sync fields needed to decide whether an
 # offboarding change belongs here or in on-prem AD; employeeId/givenName/
-# surname were already added by PRD-20321).
+# surname were already added by PRD-20321). Round 2 (acceptance item 1.6)
+# added the four on-premises/audit fields below — they were simply missing
+# from the first round's default response.
 _USER_PROFILE_SELECT = (
     "id,displayName,givenName,surname,userPrincipalName,mail,"
     "accountEnabled,usageLocation,jobTitle,department,mobilePhone,"
@@ -37,6 +39,8 @@ _USER_PROFILE_SELECT = (
     "companyName,employeeHireDate,employeeId,"
     "proxyAddresses,identities,onPremisesSyncEnabled,"
     "onPremisesLastSyncDateTime,onPremisesDistinguishedName,"
+    "onPremisesImmutableId,onPremisesSamAccountName,"
+    "createdDateTime,lastPasswordChangeDateTime,"
     "provisionedPlans,assignedLicenses,"
     "licenseAssignmentStates"
 )
@@ -434,8 +438,14 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         params: dict = {}
         if select:
-            fields = ["id"] + [f for f in select if f != "id"]
-            params["$select"] = ",".join(fields)
+            # "manager" is a navigation property, not a flat property --
+            # Graph silently drops it from $select instead of erroring, so
+            # route it to $expand instead (PRD-20393 round 2, Defect 4).
+            manager_requested = "manager" in select
+            other_fields = [f for f in select if f not in ("id", "manager")]
+            params["$select"] = ",".join(["id"] + other_fields)
+            if manager_requested:
+                params["$expand"] = "manager($select=id,displayName,userPrincipalName)"
         else:
             params["$select"] = _USER_PROFILE_SELECT
             params["$expand"] = "manager($select=id,displayName,userPrincipalName)"
@@ -652,8 +662,15 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         try:
             await client.patch(f"/users/{user_id}", body)
+            # Re-read the changed fields so `updated` reflects what Graph
+            # actually stored (e.g. a cleared field reads back as null),
+            # not just the key names we sent (PRD-20393 round 2, Defect 2).
+            readback = await client.get(
+                f"/users/{user_id}", params={"$select": ",".join(body.keys())}
+            )
+            updated = {key: readback.get(key) for key in body}
             return dump_json_capped(
-                {"status": "success", "user_id": user_id, "updated": list(body.keys())}
+                {"status": "success", "user_id": user_id, "updated": updated}
             )
         except GraphError as e:
             return e.to_envelope()
@@ -694,21 +711,62 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     ) -> str:
         """Remove an Entra ID user's manager, without needing a replacement.
 
-        Use during offboarding to clear the manager relationship (e.g. before
-        reassigning the user's reports to someone else). Calling this on a
-        user with no manager set is not an error — it reports no_manager.
+        Use during offboarding to clear the manager relationship. A user
+        with no manager set is not an error: removed=false,
+        reason="no_manager". Returns {"user_id", "removed": bool,
+        "previous_manager": {id, display_name, user_principal_name} | null,
+        "reason": "no_manager" | null}.
         """
         client = client_factory()
         if client is None:
             return NO_TOKEN
 
+        # Read the manager first rather than relying on DELETE's 404 to mean
+        # "no manager" -- against a real tenant a second DELETE on an already
+        # managerless user does not 404, so that signal doesn't hold
+        # (PRD-20393 round 2, Defect 3). Reading first also lets us report
+        # who the manager was, which the old delete-only flow never could.
         try:
-            await client.delete(f"/users/{user_id}/manager/$ref")
-            return dump_json_capped({"status": "removed", "user_id": user_id})
+            manager = await client.get(
+                f"/users/{user_id}/manager",
+                params={"$select": "id,displayName,userPrincipalName"},
+            )
         except GraphError as e:
             if e.status_code == 404:
-                return dump_json_capped({"status": "no_manager", "user_id": user_id})
+                return dump_json_capped(
+                    {
+                        "user_id": user_id,
+                        "removed": False,
+                        "previous_manager": None,
+                        "reason": "no_manager",
+                    }
+                )
             return e.to_envelope()
+
+        previous_manager = {
+            "id": manager.get("id"),
+            "display_name": manager.get("displayName"),
+            "user_principal_name": manager.get("userPrincipalName"),
+        }
+
+        try:
+            await client.delete(f"/users/{user_id}/manager/$ref")
+        except GraphError as e:
+            # A 404 here means a concurrent caller removed the manager
+            # between our GET and this DELETE (AC7) -- the end state this
+            # call wanted (no manager) already holds, so that race is a
+            # success, not an error.
+            if e.status_code != 404:
+                return e.to_envelope()
+
+        return dump_json_capped(
+            {
+                "user_id": user_id,
+                "removed": True,
+                "previous_manager": previous_manager,
+                "reason": None,
+            }
+        )
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
     async def graph_list_auth_methods(

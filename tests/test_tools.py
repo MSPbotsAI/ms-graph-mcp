@@ -1216,7 +1216,7 @@ async def test_update_user_patches_only_the_given_profile_field():
     mcp, client = _register(users)
     await mcp.call_tool("graph_update_user", {"user_id": "u1", "street_address": "2 Elm St"})
 
-    assert client.methods == ["PATCH"]
+    assert client.methods == ["PATCH", "GET"]  # PRD-20393 r2: re-read after PATCH
     assert client.calls[0][0] == "/users/u1"
     assert client.bodies[0] == {"streetAddress": "2 Elm St"}
 
@@ -1245,7 +1245,7 @@ async def test_update_user_writes_employee_id():
     mcp, client = _register(users)
     await mcp.call_tool("graph_update_user", {"user_id": "u1", "employee_id": "E12345"})
 
-    assert client.methods == ["PATCH"]
+    assert client.methods == ["PATCH", "GET"]  # PRD-20393 r2: re-read after PATCH
     assert client.bodies[0] == {"employeeId": "E12345"}
 
 
@@ -1258,7 +1258,7 @@ async def test_update_user_clears_employee_id():
     mcp, client = _register(users)
     await mcp.call_tool("graph_update_user", {"user_id": "u1", "clear_employee_id": True})
 
-    assert client.methods == ["PATCH"]
+    assert client.methods == ["PATCH", "GET"]  # PRD-20393 r2: re-read after PATCH
     assert client.bodies[0] == {"employeeId": None}
 
 
@@ -1307,32 +1307,82 @@ async def test_get_user_returns_given_name_and_surname():
 
 @pytest.mark.asyncio
 async def test_list_user_groups_paginates_with_skiptoken():
-    """AC1/TC1: chaining next_page_token across calls must return every
-    group exactly once and terminate with has_more=false, next_page_token=null."""
+    """AC1/TC1 (PRD-20393 round 2, Defect 1 fix): chaining next_page_token
+    across calls must return every group exactly once and terminate with
+    has_more=false, next_page_token=null -- for a user who also has
+    non-group `memberOf` entries (e.g. a directory role).
+
+    Round 1's version of this test only ever fed the fake client
+    already-pure-group pages, so it never exercised the mixed-type
+    `/memberOf` response that caused Defect 1 in production (a raw page
+    whose items were all filtered out client-side still carried a valid
+    $skiptoken, so the walk could show runs of empty pages and, in the
+    worst case, never converge). The round-2 fix moves the group-only
+    filter from client-side Python into the Graph request itself (the
+    OData cast `/memberOf/microsoft.graph.group`), so the fake client here
+    never needs to model a non-group item in `value` at all -- Graph's own
+    endpoint contract is that every item it returns already is a group.
+    The regression guard for Defect 1 is therefore the request path
+    assertion below plus "pagination terminates with the right set and no
+    duplicates", not a client-side type filter (there isn't one anymore).
+    """
     from graph_mcp.tools import groups
 
     mcp, client = _register(groups)
     client._result = {
         "value": [{"id": "g1", "groupTypes": [], "mailEnabled": False}],
-        "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/u1/memberOf?$skiptoken=P1",
+        "@odata.nextLink": (
+            "https://graph.microsoft.com/v1.0/users/u1/"
+            "memberOf/microsoft.graph.group?$skiptoken=P1"
+        ),
     }
     first = json.loads(
-        (await mcp.call_tool("graph_list_user_groups", {"user_id": "u1"}))[0][0].text
+        (await mcp.call_tool("graph_list_user_groups", {"user_id": "u1", "max_results": 1}))[
+            0
+        ][0].text
     )
     assert first["has_more"] is True
     assert first["next_page_token"] == "P1"
     assert [g["id"] for g in first["groups"]] == ["g1"]
+    assert client.calls[0][0] == "/users/u1/memberOf/microsoft.graph.group"
 
-    client._result = {"value": [{"id": "g2", "groupTypes": [], "mailEnabled": False}]}
+    client._result = {
+        "value": [{"id": "g2", "groupTypes": [], "mailEnabled": False}],
+        "@odata.nextLink": (
+            "https://graph.microsoft.com/v1.0/users/u1/"
+            "memberOf/microsoft.graph.group?$skiptoken=P2"
+        ),
+    }
     second = json.loads(
         (
-            await mcp.call_tool("graph_list_user_groups", {"user_id": "u1", "page_token": "P1"})
+            await mcp.call_tool(
+                "graph_list_user_groups", {"user_id": "u1", "max_results": 1, "page_token": "P1"}
+            )
         )[0][0].text
     )
-    assert second["has_more"] is False
-    assert second["next_page_token"] is None
+    assert second["has_more"] is True
+    assert second["next_page_token"] == "P2"
     assert [g["id"] for g in second["groups"]] == ["g2"]
     assert client.calls[1][1]["$skiptoken"] == "P1"
+
+    client._result = {"value": [{"id": "g3", "groupTypes": [], "mailEnabled": False}]}
+    third = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_list_user_groups", {"user_id": "u1", "max_results": 1, "page_token": "P2"}
+            )
+        )[0][0].text
+    )
+    assert third["has_more"] is False
+    assert third["next_page_token"] is None
+    assert [g["id"] for g in third["groups"]] == ["g3"]
+    assert client.calls[2][1]["$skiptoken"] == "P2"
+
+    # Every group across all three one-at-a-time pages, no duplicates,
+    # same set a single max_results=200 call would return.
+    all_ids = [g["id"] for page in (first, second, third) for g in page["groups"]]
+    assert all_ids == ["g1", "g2", "g3"]
+    assert len(set(all_ids)) == len(all_ids)
 
 
 @pytest.mark.asyncio
@@ -1422,7 +1472,7 @@ async def test_update_user_omitted_new_fields_are_not_sent():
     mcp, client = _register(users)
     await mcp.call_tool("graph_update_user", {"user_id": "u1", "job_title": "Engineer"})
 
-    assert client.methods == ["PATCH"]
+    assert client.methods == ["PATCH", "GET"]  # PRD-20393 r2: re-read after PATCH
     assert client.bodies[0] == {"jobTitle": "Engineer"}
     for key in ("employeeId", "userPrincipalName", "displayName", "givenName", "surname"):
         assert key not in client.bodies[0]
@@ -1452,7 +1502,7 @@ async def test_update_user_explicit_null_clears_field():
     mcp, client = _register(users)
     await mcp.call_tool("graph_update_user", {"user_id": "u1", "clear_given_name": True})
 
-    assert client.methods == ["PATCH"]
+    assert client.methods == ["PATCH", "GET"]  # PRD-20393 r2: re-read after PATCH
     assert client.bodies[0] == {"givenName": None}
 
 
@@ -1501,69 +1551,223 @@ async def test_update_user_allows_verified_upn_domain():
         "graph_update_user", {"user_id": "u1", "user_principal_name": "alice@contoso.com"}
     )
 
-    assert client.methods == ["GET", "PATCH"]
+    assert client.methods == ["GET", "PATCH", "GET"]  # PRD-20393 r2: re-read after PATCH
     assert client.calls[0][0] == "/domains"
     assert client.bodies[0] == {"userPrincipalName": "alice@contoso.com"}
 
 
 @pytest.mark.asyncio
-async def test_remove_manager_deletes_manager_ref():
-    """AC9/TC9: removing a user's manager issues DELETE .../manager/$ref and
-    reports status=removed."""
+async def test_update_user_returns_rereads_changed_values():
+    """AC2/TC2 (PRD-20393 round 2, Defect 2 fix): a successful update must
+    return `updated` as an object mapping each changed field to the value
+    read back from a follow-up GET, not just the list of field names that
+    were sent -- acceptance's own literal ask ("re-read the user and return
+    each changed field with its new value"), and the follow-up GET must be
+    $select-limited to exactly the changed keys."""
     from graph_mcp.tools import users
 
     mcp, client = _register(users)
+    # The fake client returns this same body for both the PATCH (ignored)
+    # and the one GET this call makes -- it stands in for "what Graph says
+    # is now stored", which is the whole point of re-reading instead of
+    # echoing the request back.
+    client._result = {"jobTitle": "Interface Test"}
+
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_update_user", {"user_id": "u1", "job_title": "Interface Test"}
+            )
+        )[0][0].text
+    )
+
+    assert client.methods == ["PATCH", "GET"]
+    assert client.calls[1][0] == "/users/u1"
+    assert client.calls[1][1]["$select"] == "jobTitle"
+    assert result == {
+        "status": "success",
+        "user_id": "u1",
+        "updated": {"jobTitle": "Interface Test"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_remove_manager_returns_previous_manager_when_present():
+    """AC3/TC3 (PRD-20393 round 2, Defect 3 fix): removing a user's manager
+    issues GET .../manager then DELETE .../manager/$ref, and returns
+    removed=true with previous_manager populated from the GET -- replacing
+    round 1's status="removed" shape, which never reported who the manager
+    was and (per the no-manager test below) could not tell a real removal
+    from a no-op."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    client._result = {
+        "id": "mgr-1",
+        "displayName": "Mandy Manager",
+        "userPrincipalName": "mandy@contoso.com",
+    }
+
     result = json.loads(
         (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
     )
 
-    assert client.methods == ["DELETE"]
-    assert client.calls[0][0] == "/users/u1/manager/$ref"
-    assert result == {"status": "removed", "user_id": "u1"}
+    assert client.methods == ["GET", "DELETE"]
+    assert client.calls[0][0] == "/users/u1/manager"
+    assert client.calls[0][1]["$select"] == "id,displayName,userPrincipalName"
+    assert client.calls[1][0] == "/users/u1/manager/$ref"
+    assert result == {
+        "user_id": "u1",
+        "removed": True,
+        "previous_manager": {
+            "id": "mgr-1",
+            "display_name": "Mandy Manager",
+            "user_principal_name": "mandy@contoso.com",
+        },
+        "reason": None,
+    }
 
 
-class _DeleteRaisingClient:
-    """GraphClient stand-in whose DELETE always raises a given status, to
-    exercise graph_remove_manager's 404-is-not-an-error path (AC10)."""
+class _ManagerRemovalClient:
+    """GraphClient stand-in for graph_remove_manager's read-then-maybe-delete
+    sequence (PRD-20393 round 2): the GET can return a manager or raise a
+    GraphError, and the DELETE (only reached when the GET found a manager)
+    can succeed or itself raise (the AC7 concurrent-removal race)."""
 
-    def __init__(self, status_code: int):
-        self._status_code = status_code
-        self.calls: list[str] = []
+    def __init__(
+        self,
+        get_result: dict | None = None,
+        get_error: GraphError | None = None,
+        delete_error: GraphError | None = None,
+    ):
+        self._get_result = get_result
+        self._get_error = get_error
+        self._delete_error = delete_error
+        self.methods: list[str] = []
+        self.calls: list[tuple[str, dict]] = []
+
+    async def get(self, path: str, params: dict | None = None, extra_headers: dict | None = None):
+        self.methods.append("GET")
+        self.calls.append((path, params or {}))
+        if self._get_error is not None:
+            raise self._get_error
+        return self._get_result
 
     async def delete(self, path: str):
-        self.calls.append(path)
-        raise GraphError(self._status_code, "boom")
+        self.methods.append("DELETE")
+        self.calls.append((path, {}))
+        if self._delete_error is not None:
+            raise self._delete_error
+        return None
 
 
 @pytest.mark.asyncio
-async def test_remove_manager_is_idempotent_on_missing_manager():
-    """AC10/TC10: a 404 from Graph (no manager set) must come back as
-    status=no_manager, not an error envelope, and be safe to call again."""
+async def test_remove_manager_returns_no_manager_without_calling_delete():
+    """AC4/TC4 (PRD-20393 round 2, Defect 4 fix): when GET .../manager 404s
+    (no manager set), the tool must return removed=false/reason=no_manager
+    and must NOT issue a DELETE at all -- round 1's version always issued
+    DELETE and relied on a second-404-means-no-manager assumption that
+    acceptance proved does not hold against a real tenant (a repeat DELETE
+    on an already-managerless user does not 404). Calling it twice is
+    equally successful -- idempotent without ever touching DELETE."""
     from mcp.server.fastmcp import FastMCP
 
     from graph_mcp.tools import users
 
     mcp = FastMCP(name="test")
-    client = _DeleteRaisingClient(404)
+    client = _ManagerRemovalClient(get_error=GraphError(404, "no manager"))
+    users.register(mcp, lambda: client)
+
+    expected = {
+        "user_id": "u1",
+        "removed": False,
+        "previous_manager": None,
+        "reason": "no_manager",
+    }
+    result = json.loads(
+        (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
+    )
+    assert result == expected
+    assert client.methods == ["GET"]
+
+    # Calling again is equally successful, and still never reaches DELETE.
+    result2 = json.loads(
+        (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
+    )
+    assert result2 == expected
+    assert client.methods == ["GET", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_remove_manager_handles_concurrent_delete_404_as_removed():
+    """AC7 (PRD-20393 round 2, added by this design, not literally asked by
+    acceptance -- see docs/tickets/PRD-20393-r2.md Product design Open
+    Questions): if GET .../manager finds a manager but another caller
+    removes it before this call's own DELETE executes, Graph's DELETE
+    itself 404s. That race must still come back as removed=true with the
+    previous_manager captured at read time, not an error envelope -- the
+    removal this call initiated is the one that (or already did) take
+    effect."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    mcp = FastMCP(name="test")
+    client = _ManagerRemovalClient(
+        get_result={
+            "id": "mgr-1",
+            "displayName": "Mandy Manager",
+            "userPrincipalName": "mandy@contoso.com",
+        },
+        delete_error=GraphError(404, "already removed"),
+    )
     users.register(mcp, lambda: client)
 
     result = json.loads(
         (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
     )
-    assert result == {"status": "no_manager", "user_id": "u1"}
-
-    # Calling again is equally successful -- idempotent.
-    result2 = json.loads(
-        (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
-    )
-    assert result2 == {"status": "no_manager", "user_id": "u1"}
+    assert client.methods == ["GET", "DELETE"]
+    assert result == {
+        "user_id": "u1",
+        "removed": True,
+        "previous_manager": {
+            "id": "mgr-1",
+            "display_name": "Mandy Manager",
+            "user_principal_name": "mandy@contoso.com",
+        },
+        "reason": None,
+    }
 
 
 @pytest.mark.asyncio
-async def test_get_user_default_select_includes_new_fields():
-    """AC11/TC11: with no select param, the default $select must include
-    proxyAddresses, identities and the on-premises sync fields, alongside
-    today's default set (and the $expand=manager it already carried)."""
+async def test_remove_manager_surfaces_non_404_get_error():
+    """Regression guard: a genuine Graph error on the new GET .../manager
+    step (not a 404) must still come back as the structured error envelope,
+    not be swallowed or misread as no_manager."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    mcp = FastMCP(name="test")
+    client = _ManagerRemovalClient(get_error=GraphError(503, "boom"))
+    users.register(mcp, lambda: client)
+
+    result = json.loads(
+        (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
+    )
+    assert client.methods == ["GET"]
+    assert result["error"]["code"] == "upstream_error"
+
+
+@pytest.mark.asyncio
+async def test_get_user_default_select_includes_onprem_and_audit_fields():
+    """AC5/TC5 (PRD-20393 round 2, Defect 4a fix): with no select param, the
+    default $select must include proxyAddresses, identities, the
+    on-premises sync fields (round 1), AND the four on-premises/audit
+    fields acceptance found missing in round 1's release
+    (onPremisesImmutableId, onPremisesSamAccountName, createdDateTime,
+    lastPasswordChangeDateTime) -- alongside the $expand=manager it already
+    carried."""
     from graph_mcp.tools import users
 
     mcp, client = _register(users)
@@ -1576,6 +1780,10 @@ async def test_get_user_default_select_includes_new_fields():
         "onPremisesSyncEnabled",
         "onPremisesLastSyncDateTime",
         "onPremisesDistinguishedName",
+        "onPremisesImmutableId",
+        "onPremisesSamAccountName",
+        "createdDateTime",
+        "lastPasswordChangeDateTime",
     ):
         assert field in select, f"{field} missing from default $select"
     assert "$expand" in client.calls[0][1]
@@ -1583,8 +1791,9 @@ async def test_get_user_default_select_includes_new_fields():
 
 @pytest.mark.asyncio
 async def test_get_user_custom_select_narrows_fields():
-    """AC12/TC12: a select param must produce a $select of exactly those
-    fields plus id, and the default $expand=manager must not be added."""
+    """AC6/TC6 (unaffected by round 2): a select param without "manager"
+    must produce a $select of exactly those fields plus id, and no
+    $expand=manager must be added."""
     from graph_mcp.tools import users
 
     mcp, client = _register(users)
@@ -1592,6 +1801,26 @@ async def test_get_user_custom_select_narrows_fields():
 
     assert client.calls[0][1]["$select"] == "id,displayName,mail"
     assert "$expand" not in client.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_get_user_select_with_manager_adds_expand():
+    """AC6/TC6 (PRD-20393 round 2, Defect 4b fix): a select param that
+    includes "manager" must route it to $expand instead of $select -- round
+    1's version concatenated every requested name straight into $select,
+    where "manager" (a navigation property, not a flat property) is
+    silently dropped by Graph instead of erroring, so acceptance's exact
+    repro (select=["manager"]) returned nothing for that key despite the
+    tool's own docstring promising it would work."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool(
+        "graph_get_user", {"user_id": "u1", "select": ["proxyAddresses", "manager"]}
+    )
+
+    assert client.calls[0][1]["$select"] == "id,proxyAddresses"
+    assert client.calls[0][1]["$expand"] == "manager($select=id,displayName,userPrincipalName)"
 
 
 class _RaisingGetClient:

@@ -4,48 +4,76 @@
     "ac": "AC1",
     "text": "Given a user who belongs to >=3 groups and has at least one non-group memberOf entry, When graph_list_user_groups is paginated with max_results=1 to the end, Then it returns the same group set as max_results=200 in one call, with no empty pages, no duplicates, and the final page's next_page_token is null",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken"]
+    "tests": [
+      "tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken` -> PASSED (full suite: 101/101 passed, 0 regressions vs baseline 97/97; see docs/tickets/PRD-20393-r2.md Self-test section and .tdd/PRD-20393-r2-tc-evidence.txt for the raw run)"
   },
   {
     "id": "TC2",
     "ac": "AC2",
     "text": "Given a successful graph_update_user call that changes one or more fields, When the call runs, Then the response's updated is an object mapping each changed field to the value read back via a follow-up GET, not a list of field names",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_update_user_returns_rereads_changed_values"]
+    "tests": [
+      "tests/test_tools.py::test_update_user_returns_rereads_changed_values"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_update_user_returns_rereads_changed_values` -> PASSED (full suite: 101/101 passed, 0 regressions vs baseline 97/97; see docs/tickets/PRD-20393-r2.md Self-test section and .tdd/PRD-20393-r2-tc-evidence.txt for the raw run)"
   },
   {
     "id": "TC3",
     "ac": "AC3",
     "text": "Given a user with an assigned manager, When graph_remove_manager is called, Then it issues GET then DELETE and returns removed=true with previous_manager populated (id, display_name, user_principal_name)",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_remove_manager_returns_previous_manager_when_present"]
+    "tests": [
+      "tests/test_tools.py::test_remove_manager_returns_previous_manager_when_present"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_remove_manager_returns_previous_manager_when_present` -> PASSED (full suite: 101/101 passed, 0 regressions vs baseline 97/97; see docs/tickets/PRD-20393-r2.md Self-test section and .tdd/PRD-20393-r2-tc-evidence.txt for the raw run)"
   },
   {
     "id": "TC4",
     "ac": "AC4",
     "text": "Given a user with no manager assigned (Graph returns 404 on GET /manager), When graph_remove_manager is called, Then it returns removed=false, previous_manager=null, reason=no_manager, and issues no DELETE call to Graph at all",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_remove_manager_returns_no_manager_without_calling_delete"]
+    "tests": [
+      "tests/test_tools.py::test_remove_manager_returns_no_manager_without_calling_delete"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_remove_manager_returns_no_manager_without_calling_delete` -> PASSED (full suite: 101/101 passed, 0 regressions vs baseline 97/97; see docs/tickets/PRD-20393-r2.md Self-test section and .tdd/PRD-20393-r2-tc-evidence.txt for the raw run)"
   },
   {
     "id": "TC5",
     "ac": "AC5",
     "text": "Given graph_get_user is called with no select parameter, When the request is built, Then the $select sent to Graph includes onPremisesImmutableId, onPremisesSamAccountName, createdDateTime and lastPasswordChangeDateTime in addition to today's default set",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_get_user_default_select_includes_onprem_and_audit_fields"]
+    "tests": [
+      "tests/test_tools.py::test_get_user_default_select_includes_onprem_and_audit_fields"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_get_user_default_select_includes_onprem_and_audit_fields` -> PASSED (full suite: 101/101 passed, 0 regressions vs baseline 97/97; see docs/tickets/PRD-20393-r2.md Self-test section and .tdd/PRD-20393-r2-tc-evidence.txt for the raw run)"
   },
   {
     "id": "TC6",
     "ac": "AC6",
     "text": "Given graph_get_user is called with select=[\"proxyAddresses\",\"manager\"], When the request is built, Then $select is exactly \"id,proxyAddresses\" and $expand is set to \"manager($select=id,displayName,userPrincipalName)\" on the same call",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_get_user_select_with_manager_adds_expand"]
+    "tests": [
+      "tests/test_tools.py::test_get_user_select_with_manager_adds_expand"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_get_user_select_with_manager_adds_expand` -> PASSED (full suite: 101/101 passed, 0 regressions vs baseline 97/97; see docs/tickets/PRD-20393-r2.md Self-test section and .tdd/PRD-20393-r2-tc-evidence.txt for the raw run)"
   },
   {
     "id": "TC7",
     "ac": "AC7",
     "text": "Given GET /users/{id}/manager finds a manager but the subsequent DELETE /users/{id}/manager/$ref raises a 404 (concurrent removal by another caller), When graph_remove_manager runs, Then it still returns removed=true with the previous_manager captured from the GET, not an error envelope",
     "type": "auto",
-    "tests": ["tests/test_tools.py::test_remove_manager_handles_concurrent_delete_404_as_removed"]
+    "tests": [
+      "tests/test_tools.py::test_remove_manager_handles_concurrent_delete_404_as_removed"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_remove_manager_handles_concurrent_delete_404_as_removed` -> PASSED (full suite: 101/101 passed, 0 regressions vs baseline 97/97; see docs/tickets/PRD-20393-r2.md Self-test section and .tdd/PRD-20393-r2-tc-evidence.txt for the raw run)"
   }
 ]

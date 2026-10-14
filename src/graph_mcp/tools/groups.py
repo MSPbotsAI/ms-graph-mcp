@@ -97,12 +97,19 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             params["$skiptoken"] = page_token
 
         try:
-            result = await client.get(f"/users/{user_id}/memberOf", params=params)
+            # /memberOf is polymorphic (groups, directoryRoles, administrative
+            # units, ...); the OData type-cast segment makes Graph itself
+            # return only group objects per page, so $top/$skiptoken and the
+            # returned set stay the same set by construction. A client-side
+            # filter after the fact (the old approach) can silently empty out
+            # a page while $skiptoken still advances, which both loses no
+            # groups but can stall the walk on an all-filtered page and, in
+            # the reported case, never converges (PRD-20393 round 2, Defect 1).
+            result = await client.get(
+                f"/users/{user_id}/memberOf/microsoft.graph.group", params=params
+            )
             groups = []
             for obj in result.get("value", []):
-                # memberOf can also return directoryRoles; keep only groups.
-                if not (obj.get("@odata.type", "").endswith("group") or "groupTypes" in obj):
-                    continue
                 obj["sync_source"] = (
                     "on-premises" if obj.get("onPremisesSyncEnabled") else "cloud"
                 )
