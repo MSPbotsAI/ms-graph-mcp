@@ -9,3 +9,11 @@
 - `_skiptoken` 搬到了 `_common.py`（改名 `skiptoken`，不再私有），因为现在是两个文件共用，不止一个。
 - 测试覆盖：`tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken`、`::test_list_user_groups_returns_group_type_mail_enabled_and_sync_source`、`::test_list_groups_paginates_with_skiptoken`、`::test_list_tools_surface_graph_error_instead_of_raising`（参数化，同时覆盖本文件两个工具和 `graph_list_users`）（均为本单新增，在 `722e955` 上全部通过）。
 - 自动化测试未覆盖的部分：本文件这次改动没有发现需要特别记录的盲区——分页/sync_source 逻辑已经针对本仓的假 Graph 客户端完整验证；本次没有碰到任何只能在真实租户上验证的行为（对比 `users.py` 的 UPN/manager 改动，那边确实有记录在案的真实租户盲区）。
+
+## PRD-20393-r2 · 2026-10-14
+
+- 2026-10-14 针对真实租户的一次验收测试（comment `90170262303660`）发现 `graph_list_user_groups` 的分页（即上一条记录的「一次 Graph 调用一页」契约）会丢组且永不终止：客户端用来从 `/users/{id}/memberOf` 这个多态原始响应里只留下组对象的那段过滤逻辑，并不影响 `$top`/`$skiptoken`——这两者是由原始页驱动的，所以一页如果所有条目都被过滤掉，游标照样前进，最坏情况下这个遍历永远不会收敛。
+- 修复（`src/graph_mcp/tools/groups.py:69-122` @ `ccf3931`，尚未进 `master`——见本单工作分支）：Graph 调用路径从 `/users/{id}/memberOf` 改成 `/users/{id}/memberOf/microsoft.graph.group`（一个标准的 OData 类型转型段），客户端那段按类型过滤的逻辑整段删除——Graph 自己现在每页只会返回组对象，所以「过滤后的集合」和「分页遍历到的集合」在结构上天然就是同一个集合。这只是一次正确性修复；工具自己的请求/响应 JSON 契约（入参 `user_id`、`max_results`、`page_token`；出参 `count`、`groups`、`has_more`、`next_page_token`）不变。
+- 对本文件未来修复多态 Graph 导航属性分页问题的先例：**优先在请求 URL 里做 OData 类型转型，而不是在客户端做后置过滤**——后置过滤会悄悄让「被过滤的集合」和「分页游标」脱钩，这正是本次缺陷的成因。
+- 测试覆盖：`tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken`（改写为断言转型后的 URL，并走一个三页、无重复的分页场景，在 `ccf3931` 上全部通过）。
+- 自动化测试未覆盖的部分：`/memberOf/microsoft.graph.group` 这个转型本身，本轮没有对着真实租户重新验证过（这是一个标准的、有文档记载的 Graph 用法，但本仓没有真实 Graph 租户可供验证——和 `users.py` 里 UPN/manager 那几条记录的盲区是同一类）。见 `docs/tickets/PRD-20393-r2.zh.md` 「自测」一节的「本地盲区」。
