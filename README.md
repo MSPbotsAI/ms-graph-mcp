@@ -68,14 +68,16 @@ Connect your MCP client with:
 |---|---|---|
 | `graph_check_user_exists` | 按 UPN、邮箱或任一 proxy address（含别名，裸地址按 `smtp:` 匹配）查询 Entra ID 用户是否存在；proxy address 走 Graph 高级查询（`ConsistencyLevel: eventual` + `$count`）（PRD-20223） | `User.Read.All` |
 | `graph_list_users` | 列出/按显示名搜索 Entra ID 用户（前缀匹配，`exact=True` 改精确匹配），可按 `account_enabled` 过滤启用/禁用账号；默认返回 50 条、硬顶 200 条，分页走 `@odata.nextLink`，返回带 `has_more`。补的是「只知道名字片段、不知道准确 UPN」这个场景——`graph_check_user_exists` 要求准确 UPN/邮箱，答不了「有没有个叫 Alice 的」 | `User.Read.All` |
-| `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可；可一并写入办公地点、电话（`business_phones`/`mobile_phone`）、地址（`street_address`/`city`/`state`/`postal_code`）、`company_name`、`employee_hire_date`（PRD-20219）。强制要求用户首次登录改密，且不可按调用关闭；调用成功时返回体会显式包含 `passwordChangeRequiredAtNextSignIn: true` 加以确认（PRD-20412） | `User.ReadWrite.All` |
+| `graph_create_user` | 创建新的 Entra ID 用户，同时设置 usage_location 以便后续分配许可；可一并写入办公地点、电话（`business_phones`/`mobile_phone`）、地址（`street_address`/`city`/`state`/`postal_code`）、`company_name`、`employee_hire_date`（PRD-20219）、`preferred_language`（BCP-47 语言标签，如 `fr-CA`/`en-CA`，PRD-20480）。强制要求用户首次登录改密，且不可按调用关闭；调用成功时返回体会显式包含 `passwordChangeRequiredAtNextSignIn: true` 加以确认（PRD-20412） | `User.ReadWrite.All` |
 | `graph_get_user` | 读取用户完整资料，含 manager、已分配许可、以及每条许可的 `licenseAssignmentStates`（`assignedByGroup` 为 null=直接分配 / 非null=组分配继承） | `User.Read.All` |
-| `graph_update_user` | 更新用户属性（仅传入的字段会改动），含地址、公司名、入职日期；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
+| `graph_update_user` | 更新用户属性（仅传入的字段会改动），含地址、公司名、入职日期、`preferred_language`（BCP-47 语言标签，PRD-20480）；`account_enabled=false` 用于禁用账号（离职场景） | `User.ReadWrite.All` |
 | `graph_reset_password` | 管理员重置用户密码，下次登录强制改密 | `User.ReadWrite.All` + Password/User Administrator 角色 |
 | `graph_revoke_sessions` | 注销用户所有登录会话，强制重新登录 | `User.ReadWrite.All` |
 | `graph_assign_manager` | 设置用户的 manager | `User.ReadWrite.All` |
 | `graph_list_auth_methods` | 列出用户已注册的 MFA 认证方式 | `UserAuthenticationMethod.Read.All` |
+| `graph_create_tap` | 为用户生成一个 Temporary Access Pass（临时登录码），默认一次性（`is_usable_once=true`），可选 `start_date_time`/`lifetime_minutes`；再次调用会使上一个 pass 失效，不幂等（PRD-20480，E6：只发给经理的一次性登录码） | `UserAuthenticationMethod.ReadWrite.All`（平台尚未授予此 scope 前调用返回 403，需先完成租户重新同意，见下方 scope 并集说明） |
 | `graph_assign_groups` | 将用户加入一个或多个组，已在组内则幂等跳过 | `GroupMember.ReadWrite.All` |
+| `graph_add_group_owner` | 将用户设为组/Teams 的 owner，已是 owner 则幂等跳过；Teams 底层也是 M365 Group，走同一个端点（PRD-20480，E5：仅在审批之后才设为 owner——审批本身不在这个 tool 的职责内） | `Group.ReadWrite.All`（平台尚未授予此 scope 前调用返回 403，需先完成租户重新同意，见下方 scope 并集说明） |
 | `graph_remove_group_member` | 将用户移出一个或多个组，不在组内则幂等跳过 | `GroupMember.ReadWrite.All` |
 | `graph_list_user_groups` | 列出用户直接所属的组 | `GroupMember.Read.All`（注意：`GroupMember.ReadWrite.All` 不在该端点的受理列表里，必须单独申请 Read 版） |
 | `graph_list_groups` | 按显示名搜索/列出 Entra ID 组 | `Group.Read.All` |
@@ -110,15 +112,17 @@ Connect your MCP client with:
 >
 > ```
 > offline_access openid profile
-> User.ReadWrite.All UserAuthenticationMethod.Read.All
-> Group.Read.All GroupMember.Read.All GroupMember.ReadWrite.All
+> User.ReadWrite.All UserAuthenticationMethod.Read.All UserAuthenticationMethod.ReadWrite.All
+> Group.Read.All Group.ReadWrite.All GroupMember.Read.All GroupMember.ReadWrite.All
 > Organization.Read.All Mail.Read Mail.Send Mail.Send.Shared
 > Sites.ReadWrite.All Files.Read.All Files.ReadWrite.All
 > DeviceManagementManagedDevices.ReadWrite.All
 > Calendars.ReadWrite Calendars.ReadWrite.Shared
 > ```
 >
-> 其中 `User.ReadWrite.All` 覆盖建/改用户、改密、分配许可、注销会话（这些端点各自的最小权限分散在 `User-PasswordProfile.ReadWrite.All`、`User.EnableDisableAccount.All`、`LicenseAssignment.ReadWrite.All`、`User.RevokeSessions.All`，用一条覆盖比申请五条更诚实）；`Sites.ReadWrite.All` 包含 `Sites.Read.All` 故不重复列；`DeviceManagementManagedDevices.ReadWrite.All` 同理包含 `.Read.All`，覆盖 `graph_list_managed_devices` + `graph_remove_managed_device` 两个工具；**不申请** `Directory.Read.All`（没有工具需要通读目录）和 `Group.ReadWrite.All`（没有工具建组/删组/改组属性）。
+> 其中 `User.ReadWrite.All` 覆盖建/改用户、改密、分配许可、注销会话（这些端点各自的最小权限分散在 `User-PasswordProfile.ReadWrite.All`、`User.EnableDisableAccount.All`、`LicenseAssignment.ReadWrite.All`、`User.RevokeSessions.All`，用一条覆盖比申请五条更诚实）；`Sites.ReadWrite.All` 包含 `Sites.Read.All` 故不重复列；`DeviceManagementManagedDevices.ReadWrite.All` 同理包含 `.Read.All`，覆盖 `graph_list_managed_devices` + `graph_remove_managed_device` 两个工具；**不申请** `Directory.Read.All`（没有工具需要通读目录）。
+>
+> **`UserAuthenticationMethod.ReadWrite.All`（`graph_create_tap`）与 `Group.ReadWrite.All`（`graph_add_group_owner`）是 PRD-20480 新增的两个 scope**——此前的版本明确写着"不申请 `Group.ReadWrite.All`（没有工具建组/删组/改组属性）"，这句话随这两个新工具的加入已经过期。这两个 scope 需要先由平台侧（`MCP-Management-Service` 的 `auth/oauth/vendors/msgraph.py`，不在本仓库范围内）加入请求的 scope 集合，然后每个已经连接了 Microsoft Graph 连接器的租户都需要重新同意一次，这两个工具在其租户完成重新同意之前会持续返回 403——与 `Mail.Read`（PRD-19103）、`Calendars.ReadWrite`（PRD-18631）的上线路径相同，是已知、可重复的流程，不是新的风险类别。
 >
 > `Files.Read.All` / `Files.ReadWrite.All` 是运维决定一并申请的：如上一条所述，对本文件用到的 `/sites/*`、`/drives/*` 端点，`Files.*` 与 `Sites.*` 是**二选一**的替代权限组，工具本身不需要它——加上是为了让"管理员只同意了其中一组"的租户也能落到可用状态。代价是 `Files.*` 同时覆盖每个用户的 OneDrive，而这里没有任何工具会去碰它。
 

@@ -279,6 +279,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         postal_code: Annotated[str | None, Field(description="Postal / ZIP code.")] = None,
         company_name: Annotated[str | None, Field(description="Company name.")] = None,
         employee_hire_date: Annotated[str | None, Field(description=_HIRE_DATE_DESC)] = None,
+        preferred_language: Annotated[
+            str | None,
+            Field(description='BCP-47 UI language tag, e.g. "fr-CA", "en-CA" (PRD-20480).'),
+        ] = None,
     ) -> str:
         """Create a new Entra ID user account.
 
@@ -317,6 +321,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             body["businessPhones"] = business_phones
         if mobile_phone is not None:
             body["mobilePhone"] = mobile_phone
+        if preferred_language is not None:
+            body["preferredLanguage"] = preferred_language
         bad = _add_profile_fields(
             body,
             street_address=street_address,
@@ -556,6 +562,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 )
             ),
         ] = False,
+        preferred_language: Annotated[
+            str | None,
+            Field(description='BCP-47 UI language tag to set, e.g. "fr-CA", "en-CA" (PRD-20480).'),
+        ] = None,
     ) -> str:
         """Update attributes on an existing Entra ID user.
 
@@ -635,6 +645,8 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             body["department"] = department
         if office_location is not None:
             body["officeLocation"] = office_location
+        if preferred_language is not None:
+            body["preferredLanguage"] = preferred_language
         bad = _add_profile_fields(
             body,
             street_address=street_address,
@@ -727,6 +739,73 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             result = await client.get(f"/users/{user_id}/authentication/methods")
             methods = result.get("value", []) if isinstance(result, dict) else []
             return dump_json_capped({"user_id": user_id, "count": len(methods), "methods": methods})
+        except GraphError as e:
+            return e.to_envelope()
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=False))
+    async def graph_create_tap(
+        user_id: Annotated[
+            str, Field(description="Target user's id (GUID) or userPrincipalName.")
+        ],
+        start_date_time: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "ISO 8601 date-time the pass becomes valid from. Omit to make "
+                    "it valid immediately."
+                )
+            ),
+        ] = None,
+        lifetime_minutes: Annotated[
+            int | None,
+            Field(description="How long the pass stays valid, in minutes (Graph default applies if omitted)."),
+        ] = None,
+        is_usable_once: Annotated[
+            bool,
+            Field(
+                description=(
+                    "True (default): the pass can be used for exactly one sign-in, "
+                    "then is invalidated — matches sending a one-time code to a "
+                    "manager for a new hire (PRD-20480). False: reusable for the "
+                    "whole lifetime window."
+                )
+            ),
+        ] = True,
+    ) -> str:
+        """Create a Temporary Access Pass (TAP) a user can sign in with
+        instead of a password.
+
+        Calling this again for the same user replaces any existing pass —
+        not idempotent. temporary_access_pass is a one-time secret only
+        returned at creation; capture it now, it cannot be read back later.
+        Needs UserAuthenticationMethod.ReadWrite.All; 403 until the tenant
+        has re-consented after that scope is granted (see README).
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        body: dict = {"isUsableOnce": is_usable_once}
+        if start_date_time is not None:
+            body["startDateTime"] = start_date_time
+        if lifetime_minutes is not None:
+            body["lifetimeInMinutes"] = lifetime_minutes
+
+        try:
+            result = await client.post(
+                f"/users/{user_id}/authentication/temporaryAccessPassMethods", body
+            )
+            payload = result if isinstance(result, dict) else {}
+            return dump_json_capped(
+                {
+                    "user_id": user_id,
+                    "temporary_access_pass": payload.get("temporaryAccessPass"),
+                    "lifetime_minutes": payload.get("lifetimeInMinutes"),
+                    "is_usable_once": payload.get("isUsableOnce"),
+                    "is_usable": payload.get("isUsable"),
+                    "method_usability_reason": payload.get("methodUsabilityReason"),
+                }
+            )
         except GraphError as e:
             return e.to_envelope()
 

@@ -29,8 +29,10 @@ EXPECTED_TOOLS = {
     "graph_assign_manager": {"user_id", "manager_id"},
     "graph_remove_manager": {"user_id"},
     "graph_list_auth_methods": {"user_id"},
+    "graph_create_tap": {"user_id"},
     "graph_revoke_sessions": {"user_id"},
     "graph_assign_groups": {"user_id", "group_ids"},
+    "graph_add_group_owner": {"group_id", "user_id"},
     "graph_list_user_groups": {"user_id"},
     "graph_list_groups": set(),
     "graph_remove_group_member": {"user_id", "group_ids"},
@@ -70,6 +72,8 @@ _NON_READ_ONLY = {
     "graph_remove_manager",
     "graph_revoke_sessions",
     "graph_assign_groups",
+    "graph_add_group_owner",
+    "graph_create_tap",
     "graph_remove_group_member",
     "graph_assign_license",
     "graph_reprocess_license",
@@ -126,7 +130,14 @@ async def test_tools_list_snapshot():
     # site -> drive -> file chain into one call so the model never has to
     # copy a driveId between calls — the id-copying is what caused the
     # reopened PRD-20211 intermittent "malformed drive id" failure.
-    assert len(names) <= 39, "tool count should stay within SOP's <=20 guideline (+19 justified)"
+    # +2 for PRD-20480 (M365 onboarding tool-gap list): graph_create_tap
+    # (no existing tool touches /authentication/temporaryAccessPassMethods)
+    # and graph_add_group_owner (owners/$ref is a distinct endpoint from
+    # members/$ref, same as the existing member-vs-owner split already
+    # reflected by graph_list_owned_groups). preferred_language is a new
+    # optional parameter on graph_create_user/graph_update_user, not a
+    # new tool, so it does not add to this count.
+    assert len(names) <= 41, "tool count should stay within SOP's <=20 guideline (+21 justified)"
 
     by_name = {t.name: t for t in tools}
     for name, expected_required in EXPECTED_TOOLS.items():
@@ -2214,3 +2225,174 @@ async def test_read_site_file_text_only_issues_get_requests():
     await _read_site_file(client)
 
     assert client.methods and all(m == "GET" for m in client.methods)
+
+
+# ---------------------------------------------------------------------------
+# PRD-20480: graph_create_tap, graph_add_group_owner, preferred_language
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_user_sets_preferred_language():
+    """TC-MSG-006/AC7: preferred_language on graph_create_user must land in
+    the Graph body as preferredLanguage, alongside the other optional fields."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool(
+        "graph_create_user", {**_BASE_CREATE_ARGS, "preferred_language": "fr-CA"}
+    )
+
+    assert client.bodies[0]["preferredLanguage"] == "fr-CA"
+
+
+@pytest.mark.asyncio
+async def test_update_user_sets_preferred_language():
+    """TC-MSG-007/AC7: preferred_language on graph_update_user must PATCH
+    preferredLanguage, and omitting it must not touch the field at all."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool(
+        "graph_update_user", {"user_id": "u1", "preferred_language": "en-CA"}
+    )
+
+    assert client.bodies[0] == {"preferredLanguage": "en-CA"}
+
+
+@pytest.mark.asyncio
+async def test_graph_create_tap_default_is_usable_once():
+    """TC-MSG-001/AC1: with no optional params, the request must default to
+    isUsableOnce=true, and the response must echo Graph's TAP fields back."""
+    from graph_mcp.tools import users
+
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP(name="test")
+    client = _CapturingClient(
+        result={
+            "temporaryAccessPass": "abcd1234",
+            "lifetimeInMinutes": 60,
+            "isUsableOnce": True,
+            "isUsable": False,
+            "methodUsabilityReason": "NotYetValid",
+        }
+    )
+    users.register(mcp, lambda: client)
+
+    result = json.loads(
+        (await mcp.call_tool("graph_create_tap", {"user_id": "u1"}))[0][0].text
+    )
+
+    assert client.methods == ["POST"]
+    assert client.calls[0][0] == "/users/u1/authentication/temporaryAccessPassMethods"
+    assert client.bodies[0] == {"isUsableOnce": True}
+    assert result["temporary_access_pass"] == "abcd1234"
+    assert result["is_usable_once"] is True
+    assert result["method_usability_reason"] == "NotYetValid"
+
+
+@pytest.mark.asyncio
+async def test_graph_create_tap_honors_explicit_settings():
+    """TC-MSG-002/AC1: explicit is_usable_once=False + lifetime_minutes must
+    be sent through to Graph as-is, and start_date_time included when given."""
+    from graph_mcp.tools import users
+
+    mcp, client = _register(users)
+    await mcp.call_tool(
+        "graph_create_tap",
+        {
+            "user_id": "u1",
+            "start_date_time": "2026-10-15T00:00:00Z",
+            "lifetime_minutes": 120,
+            "is_usable_once": False,
+        },
+    )
+
+    assert client.bodies[0] == {
+        "isUsableOnce": False,
+        "startDateTime": "2026-10-15T00:00:00Z",
+        "lifetimeInMinutes": 120,
+    }
+
+
+@pytest.mark.asyncio
+async def test_graph_create_tap_user_not_found_returns_envelope():
+    """TC-MSG-003/AC2: a 404 from Graph must come back as a structured
+    not_found error envelope, not a raw exception."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    class _NotFoundClient:
+        async def post(self, path: str, body=None, extra_headers=None):
+            raise GraphError(404, "Resource 'bad-user' does not exist.")
+
+    mcp = FastMCP(name="test")
+    users.register(mcp, lambda: _NotFoundClient())
+
+    result = json.loads(
+        (await mcp.call_tool("graph_create_tap", {"user_id": "bad-user"}))[0][0].text
+    )
+
+    assert result["error"]["code"] == "not_found"
+    assert result["error"]["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_graph_add_group_owner_adds_new_owner():
+    """TC-MSG-004/AC6: adding a non-owner must POST .../owners/$ref and
+    report status=added."""
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups)
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_add_group_owner", {"group_id": "g1", "user_id": "u1"}
+            )
+        )[0][0].text
+    )
+
+    assert client.methods == ["POST"]
+    assert client.calls[0][0] == "/groups/g1/owners/$ref"
+    assert client.bodies[0] == {
+        "@odata.id": "https://graph.microsoft.com/v1.0/directoryObjects/u1"
+    }
+    assert result == {"group_id": "g1", "user_id": "u1", "status": "added"}
+
+
+@pytest.mark.asyncio
+async def test_graph_add_group_owner_is_idempotent_for_existing_owner():
+    """TC-MSG-005/AC6: a 400 "already exist" from Graph must report
+    already_owner, not an error, mirroring graph_assign_groups."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import groups
+
+    class _AlreadyOwnerClient:
+        async def post(self, path: str, body=None, extra_headers=None):
+            raise GraphError(400, "One or more added object references already exist.")
+
+    mcp = FastMCP(name="test")
+    groups.register(mcp, lambda: _AlreadyOwnerClient())
+
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_add_group_owner", {"group_id": "g1", "user_id": "u1"}
+            )
+        )[0][0].text
+    )
+
+    assert result == {"group_id": "g1", "user_id": "u1", "status": "already_owner"}
+
+    # Calling again is equally successful — idempotent.
+    result2 = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_add_group_owner", {"group_id": "g1", "user_id": "u1"}
+            )
+        )[0][0].text
+    )
+    assert result2 == {"group_id": "g1", "user_id": "u1", "status": "already_owner"}

@@ -65,6 +65,50 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         return dump_json_capped({"user_id": user_id, "results": results})
 
+    @mcp.tool(
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
+    )
+    async def graph_add_group_owner(
+        group_id: Annotated[str, Field(description="Object ID of the group or Team.")],
+        user_id: Annotated[str, Field(description="Object ID of the user to set as owner.")],
+    ) -> str:
+        """Add an Entra ID user as an owner of a group or Team.
+
+        Already-an-owner is treated as success (idempotent), mirroring
+        graph_assign_groups. Teams is backed by an M365 Group in Graph, so
+        this covers both. Enforces no approval step — any SOP-level
+        approval must happen before calling this (PRD-20480).
+        """
+        client = client_factory()
+        if client is None:
+            return NO_TOKEN
+
+        owner_url = _DIRECTORY_OBJECT_URL.format(user_id=user_id)
+
+        try:
+            await client.post(
+                f"/groups/{group_id}/owners/$ref",
+                {"@odata.id": owner_url},
+            )
+            return dump_json_capped(
+                {"group_id": group_id, "user_id": user_id, "status": "added"}
+            )
+        except GraphError as e:
+            # Graph returns 400 when the user is already an owner — mirror
+            # graph_assign_groups's existing "already exist" handling.
+            if e.status_code == 400 and "already exist" in str(e.message).lower():
+                return dump_json_capped(
+                    {"group_id": group_id, "user_id": user_id, "status": "already_owner"}
+                )
+            return dump_json_capped(
+                {
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "status": "error",
+                    "detail": e.message,
+                }
+            )
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
     async def graph_list_user_groups(
         user_id: Annotated[str, Field(description="User's id (GUID) or userPrincipalName.")],
