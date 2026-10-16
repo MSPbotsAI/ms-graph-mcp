@@ -1,0 +1,92 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Characterization: given attachments using only content_base64/content_text, graph_send_mail accepts and sends them with zero correctness check against the stated filename -- the structural gap this design's content_url mechanism is built to avoid (no source-of-truth check is possible for inline content).",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_inline_attachment_has_no_content_correctness_check"]
+  },
+  {
+    "id": "TC2",
+    "ac": "AC1",
+    "text": "Given content_url pointing to an allow-listed host serving content under the per-file size cap, When graph_send_mail is called, Then the mail is sent with exactly the fetched bytes as the attachment.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_fetches_and_attaches_exact_bytes"]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC2",
+    "text": "Given content_url whose host is not on the allow-list, When graph_send_mail is called, Then the tool returns invalid_argument naming the rejected host, and no Graph request is made.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_rejects_host_not_on_allowlist"]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC3",
+    "text": "Given the default empty allow-list, When any attachment specifies content_url, Then it is rejected with invalid_argument stating the feature is not configured, and no Graph request is made.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_rejected_when_allowlist_empty"]
+  },
+  {
+    "id": "TC5",
+    "ac": "AC4",
+    "text": "Given the content_url fetch returns HTTP 500, When graph_send_mail is called, Then the tool returns upstream_error (retryable=true), and no Graph request is made.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_fetch_5xx_returns_upstream_error"]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC4",
+    "text": "Given the content_url fetch returns HTTP 404, When graph_send_mail is called, Then the tool returns not_found (retryable=false), and no Graph request is made.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_fetch_404_returns_not_found"]
+  },
+  {
+    "id": "TC7",
+    "ac": "AC5",
+    "text": "Given the content_url fetch succeeds but returns content over _MAX_ATTACHMENT_BYTES, When graph_send_mail is called, Then the existing size-limit error fires citing the actual fetched byte count, and no Graph request is made.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_oversized_fetch_rejected"]
+  },
+  {
+    "id": "TC8",
+    "ac": "AC6",
+    "text": "Given an attachment specifies both content_text and content_url (or content_base64 and content_url), When graph_send_mail is called, Then the tool returns invalid_argument (\"needs exactly one of\"), and no Graph request is made.",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_attachment_rejects_multiple_content_sources"]
+  },
+  {
+    "id": "TC9",
+    "ac": "AC7",
+    "text": "Given attachments using only content_text or content_base64 exactly as before (PRD-19661/PRD-20416), When graph_send_mail is called, Then behavior and response shape are byte-for-byte identical to pre-change.",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_send_mail_attaches_one_file_correctly",
+      "tests/test_tools.py::test_send_mail_attaches_multiple_files_up_to_limit",
+      "tests/test_tools.py::test_send_mail_without_attachments_matches_prior_payload_shape"
+    ]
+  },
+  {
+    "id": "TC10",
+    "ac": "AC8",
+    "text": "Given a successful send with one or more attachments (any source), When the call completes, Then the server logs one entry per attachment with filename, decoded byte length, sha256 and source (inline|url).",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_logs_attachment_metadata"]
+  },
+  {
+    "id": "TC11",
+    "ac": "AC1",
+    "text": "Given a real HTTPS URL on an allow-listed test host and a live Graph test mailbox, When the mail is sent with content_url pointing at that URL, Then the mail received carries an attachment whose sha256 matches the source file's sha256 exactly.",
+    "type": "manual",
+    "steps": [
+      "Stand up or pick a test HTTPS host and add it to ATTACHMENT_FETCH_ALLOWED_HOSTS for this run",
+      "Place a known file (e.g. a sample report .html) at a URL on that host; record its sha256",
+      "Call graph_send_mail against a live Graph test mailbox with one attachment: {filename, content_url: <that URL>}",
+      "Open the received mail in the test mailbox and download the attachment",
+      "Compute sha256 of the downloaded attachment"
+    ],
+    "expect": "Downloaded attachment's sha256 exactly equals the source file's recorded sha256; filename matches what was specified.",
+    "result": "untested",
+    "evidence": ""
+  }
+]
