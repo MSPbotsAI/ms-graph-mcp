@@ -59,7 +59,7 @@ EXPECTED_TOOLS = {
     "graph_get_user_availability": {"user_ids", "start_datetime", "end_datetime"},
     "graph_create_calendar_event": {"subject", "start_datetime", "end_datetime"},
     "graph_cancel_calendar_event": {"event_id"},
-    "graph_transfer_onedrive": {"source_user_id", "destination_user_id"},
+    "graph_transfer_onedrive": {"source_user_id", "recipient_user_id"},
     "graph_start_cloud_sync": {"user_id"},
 }
 
@@ -2648,16 +2648,23 @@ async def test_read_site_file_text_only_issues_get_requests():
 class _RoutedClient:
     """GraphClient stand-in for offboarding.py's multi-endpoint resolve/
     list/act flows: GET responses are keyed by exact path (a dict to
-    return, or a GraphError to raise); POST responses are keyed by exact
-    path too, defaulting to {} when the test doesn't care about the body.
+    return, or a GraphError to raise); POST and PATCH responses are keyed by
+    exact path too, defaulting to {} when the test doesn't care about the body.
     Every call is recorded for assertions on call order/count.
     """
 
-    def __init__(self, get_responses: dict, post_responses: dict | None = None):
+    def __init__(
+        self,
+        get_responses: dict,
+        post_responses: dict | None = None,
+        patch_responses: dict | None = None,
+    ):
         self._get_responses = dict(get_responses)
         self._post_responses = dict(post_responses or {})
+        self._patch_responses = dict(patch_responses or {})
         self.get_calls: list[tuple[str, dict]] = []
         self.post_calls: list[tuple[str, dict]] = []
+        self.patch_calls: list[tuple[str, dict]] = []
 
     async def get(self, path, params=None, extra_headers=None):
         self.get_calls.append((path, params or {}))
@@ -2669,6 +2676,13 @@ class _RoutedClient:
     async def post(self, path, body=None, extra_headers=None):
         self.post_calls.append((path, body or {}))
         resp = self._post_responses.get(path, {})
+        if isinstance(resp, GraphError):
+            raise resp
+        return resp
+
+    async def patch(self, path, body=None):
+        self.patch_calls.append((path, body or {}))
+        resp = self._patch_responses.get(path, {})
         if isinstance(resp, GraphError):
             raise resp
         return resp
@@ -2690,150 +2704,215 @@ async def _call_offboarding(client, tool_name, **args):
     return json.loads(result[0][0].text)
 
 
-@pytest.mark.asyncio
-async def test_transfer_onedrive_starts_copy_for_new_items():
-    """AC2/TC2: a fresh transfer with no destination overlap returns
-    status=started and issues one copy per source item."""
-    client = _RoutedClient(
-        get_responses={
-            "/users/u-src/drive": {"id": "d-src"},
-            "/users/u-dst/drive": {"id": "d-dst"},
-            "/drives/d-src/root/children": {
-                "value": [
-                    {"id": "item1", "name": "a.txt", "size": 10},
-                    {"id": "item2", "name": "b.txt", "size": 20},
-                ]
-            },
-            "/drives/d-dst/root:/offboarded-u-src:": GraphError(404, "not found"),
-            "/drives/d-dst/items/folder1/children": {"value": []},
-        },
-        post_responses={
-            "/drives/d-dst/root/children": {"id": "folder1", "name": "offboarded-u-src"},
-        },
-    )
-    payload = await _call_offboarding(
-        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
-    )
+_SRC = {"id": "u-src", "mail": "src@contoso.com", "userPrincipalName": "src@contoso.com"}
+_RCPT = {"id": "u-rcpt", "mail": "boss@contoso.com", "userPrincipalName": "boss@contoso.com"}
+_FOLDER_PATH = "/drives/d1/root:/Offboarding_Transfer:"
 
-    assert payload["status"] == "started"
-    assert payload["destination_folder"] == {"id": "folder1", "name": "offboarded-u-src"}
-    assert payload["items"] == [
-        {"name": "a.txt", "size": 10, "action": "copy_started"},
-        {"name": "b.txt", "size": 20, "action": "copy_started"},
-    ]
-    copy_paths = [p for p, _ in client.post_calls if p.endswith("/copy")]
-    assert copy_paths == [
-        "/drives/d-src/items/item1/copy",
-        "/drives/d-src/items/item2/copy",
-    ]
+
+def _transfer_routes(**overrides):
+    routes = {
+        "/users/u-src": _SRC,
+        "/users/u-rcpt": _RCPT,
+        "/users/u-src/drive": {"id": "d1"},
+        _FOLDER_PATH: GraphError(404, "not found"),
+        "/drives/d1/root/children": {
+            "value": [{"id": "i1", "name": "a.txt"}, {"id": "i2", "name": "Docs"}]
+        },
+        "/drives/d1/items/f1/permissions": {"value": []},
+    }
+    routes.update(overrides)
+    return routes
+
+
+async def _transfer(client, **args):
+    return await _call_offboarding(
+        client,
+        "graph_transfer_onedrive",
+        source_user_id="u-src",
+        recipient_user_id="u-rcpt",
+        **args,
+    )
 
 
 @pytest.mark.asyncio
-async def test_transfer_onedrive_is_idempotent_when_all_items_already_present():
-    """AC3/TC3: a repeat call where every item already matches name+size
-    returns status=completed and issues zero copy calls."""
+async def test_transfer_onedrive_archives_root_and_shares_folder():
+    """Rewst flow: create the archive folder in the SOURCE drive, move every
+    root item into it, then invite the recipient with write access."""
     client = _RoutedClient(
-        get_responses={
-            "/users/u-src/drive": {"id": "d-src"},
-            "/users/u-dst/drive": {"id": "d-dst"},
-            "/drives/d-src/root/children": {
-                "value": [{"id": "item1", "name": "a.txt", "size": 10}]
-            },
-            "/drives/d-dst/root:/offboarded-u-src:": {"id": "folder1", "name": "offboarded-u-src"},
-            "/drives/d-dst/items/folder1/children": {
-                "value": [{"name": "a.txt", "size": 10}]
-            },
-        },
+        get_responses=_transfer_routes(),
+        post_responses={"/drives/d1/root/children": {"id": "f1", "name": "Offboarding_Transfer"}},
     )
-    payload = await _call_offboarding(
-        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
-    )
+    payload = await _transfer(client)
 
     assert payload["status"] == "completed"
-    assert payload["items"] == [{"name": "a.txt", "size": 10, "action": "already_present"}]
+    assert payload["folder"] == {"id": "f1", "name": "Offboarding_Transfer"}
+    assert payload["moved"] == ["a.txt", "Docs"]
+    assert payload["failed"] == []
+    assert payload["share"] == {"status": "shared", "email": "boss@contoso.com"}
+    assert client.patch_calls == [
+        ("/drives/d1/items/i1", {"parentReference": {"id": "f1"}}),
+        ("/drives/d1/items/i2", {"parentReference": {"id": "f1"}}),
+    ]
+    invite_path, invite = client.post_calls[-1]
+    assert invite_path == "/drives/d1/items/f1/invite"
+    assert invite["recipients"] == [{"email": "boss@contoso.com"}]
+    assert invite["roles"] == ["write"]
+    assert invite["requireSignIn"] is True and invite["sendInvitation"] is True
+    # Nothing touches the recipient's drive.
+    assert not any("/users/u-rcpt/drive" in p for p, _ in client.get_calls)
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_reports_access_denied_on_403():
+    """Tom's INT case: delegated admin without site collection admin gets 403
+    on the drive. Must be access_denied with the hint, not 'no OneDrive'."""
+    client = _RoutedClient(
+        get_responses=_transfer_routes(
+            **{"/users/u-src/drive": GraphError(403, "Access denied")}
+        )
+    )
+    payload = await _transfer(client)
+
+    assert payload["error"]["code"] == "access_denied"
+    assert payload["error"]["graph_status"] == 403
+    assert payload["error"]["step"] == "open_drive"
+    assert "site collection admin" in payload["error"]["message"]
+    assert "ms-graph-app" in payload["error"]["message"]
+    assert client.post_calls == [] and client.patch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_reports_no_onedrive_on_404():
+    """A real 404 on the drive (user exists) is a skip, not an error."""
+    client = _RoutedClient(
+        get_responses=_transfer_routes(**{"/users/u-src/drive": GraphError(404, "not found")})
+    )
+    payload = await _transfer(client)
+
+    assert payload["status"] == "no_onedrive"
+    assert "error" not in payload
+    assert client.post_calls == [] and client.patch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_reports_user_not_found_separately():
+    """A missing user must not look like a missing OneDrive."""
+    client = _RoutedClient(
+        get_responses=_transfer_routes(**{"/users/u-rcpt": GraphError(404, "not found")})
+    )
+    payload = await _transfer(client)
+
+    assert payload["error"]["code"] == "user_not_found"
+    assert payload["error"]["role"] == "recipient"
+    assert not any(p.endswith("/drive") for p, _ in client.get_calls)
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_does_not_swallow_other_errors():
+    client = _RoutedClient(
+        get_responses=_transfer_routes(**{"/users/u-src/drive": GraphError(503, "busy")})
+    )
+    payload = await _transfer(client)
+
+    assert payload["error"]["code"] == "upstream_error"
+    assert payload["error"]["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_partial_when_a_move_fails():
+    client = _RoutedClient(
+        get_responses=_transfer_routes(),
+        post_responses={"/drives/d1/root/children": {"id": "f1", "name": "Offboarding_Transfer"}},
+        patch_responses={"/drives/d1/items/i2": GraphError(409, "nameAlreadyExists")},
+    )
+    payload = await _transfer(client)
+
+    assert payload["status"] == "partial"
+    assert payload["moved"] == ["a.txt"]
+    assert payload["failed"] == [
+        {"name": "Docs", "graph_status": 409, "error": "nameAlreadyExists"}
+    ]
+    # The share still goes out so the recipient gets what did move.
+    assert payload["share"]["status"] == "shared"
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_retry_reuses_folder_and_skips_existing_share():
+    """Second call after a partial run: the folder is found by name (no new
+    folder, no rename), only what is still in the root moves, and the
+    recipient who already has write access is not invited again."""
+    client = _RoutedClient(
+        get_responses=_transfer_routes(
+            **{
+                _FOLDER_PATH: {"id": "f1", "name": "Offboarding_Transfer", "folder": {}},
+                "/drives/d1/root/children": {
+                    "value": [
+                        {"id": "f1", "name": "Offboarding_Transfer"},
+                        {"id": "i2", "name": "Docs"},
+                    ]
+                },
+                "/drives/d1/items/f1/permissions": {
+                    "value": [
+                        {
+                            "roles": ["write"],
+                            "grantedToV2": {"user": {"id": "u-rcpt", "email": "x@y"}},
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    payload = await _transfer(client)
+
+    assert payload["status"] == "completed"
+    assert payload["moved"] == ["Docs"]
+    assert payload["share"] == {"status": "already_shared"}
     assert client.post_calls == []
+    assert [p for p, _ in client.patch_calls] == ["/drives/d1/items/i2"]
 
 
 @pytest.mark.asyncio
-async def test_transfer_onedrive_does_not_recopy_items_mid_transfer():
-    """AC4/TC4: a destination item present at a different size is still
-    mid-copy -- status=in_progress, no duplicate copy issued for it."""
+async def test_transfer_onedrive_no_content_for_empty_drive():
     client = _RoutedClient(
-        get_responses={
-            "/users/u-src/drive": {"id": "d-src"},
-            "/users/u-dst/drive": {"id": "d-dst"},
-            "/drives/d-src/root/children": {
-                "value": [{"id": "item1", "name": "a.txt", "size": 10}]
-            },
-            "/drives/d-dst/root:/offboarded-u-src:": {"id": "folder1", "name": "offboarded-u-src"},
-            "/drives/d-dst/items/folder1/children": {
-                "value": [{"name": "a.txt", "size": 5}]
-            },
-        },
+        get_responses=_transfer_routes(**{"/drives/d1/root/children": {"value": []}})
     )
-    payload = await _call_offboarding(
-        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
-    )
-
-    assert payload["status"] == "in_progress"
-    assert payload["items"] == [{"name": "a.txt", "size": 10, "action": "in_progress"}]
-    assert client.post_calls == []
-
-
-@pytest.mark.asyncio
-async def test_transfer_onedrive_reports_drive_not_found_for_source():
-    """AC5/TC5: a source with no OneDrive returns drive_not_found naming
-    the source and never calls the destination."""
-    client = _RoutedClient(
-        get_responses={"/users/u-src/drive": GraphError(404, "not found")},
-    )
-    payload = await _call_offboarding(
-        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
-    )
-
-    assert payload["error"]["code"] == "drive_not_found"
-    assert payload["error"]["role"] == "source"
-    assert client.get_calls == [("/users/u-src/drive", {"$select": "id,driveType"})]
-
-
-@pytest.mark.asyncio
-async def test_transfer_onedrive_reports_no_content_for_empty_source():
-    """AC6/TC6: an empty source root returns status=no_content and creates
-    no destination folder."""
-    client = _RoutedClient(
-        get_responses={
-            "/users/u-src/drive": {"id": "d-src"},
-            "/users/u-dst/drive": {"id": "d-dst"},
-            "/drives/d-src/root/children": {"value": []},
-        },
-    )
-    payload = await _call_offboarding(
-        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
-    )
+    payload = await _transfer(client)
 
     assert payload["status"] == "no_content"
-    assert payload["items"] == []
-    assert client.post_calls == []
-    assert not any("root:/" in p for p, _ in client.get_calls)
+    assert client.post_calls == [] and client.patch_calls == []
 
 
 @pytest.mark.asyncio
-async def test_transfer_onedrive_reports_drive_not_found_for_destination():
-    """AC7/TC7: a destination with no OneDrive returns drive_not_found
-    naming the destination and never lists the source's content."""
+async def test_transfer_onedrive_share_failure_is_partial():
     client = _RoutedClient(
-        get_responses={
-            "/users/u-src/drive": {"id": "d-src"},
-            "/users/u-dst/drive": GraphError(404, "not found"),
+        get_responses=_transfer_routes(),
+        post_responses={
+            "/drives/d1/root/children": {"id": "f1", "name": "Offboarding_Transfer"},
+            "/drives/d1/items/f1/invite": GraphError(400, "invalid recipient"),
         },
     )
-    payload = await _call_offboarding(
-        client, "graph_transfer_onedrive", source_user_id="u-src", destination_user_id="u-dst"
-    )
+    payload = await _transfer(client)
 
-    assert payload["error"]["code"] == "drive_not_found"
-    assert payload["error"]["role"] == "destination"
-    assert not any(p == "/drives/d-src/root/children" for p, _ in client.get_calls)
+    assert payload["status"] == "partial"
+    assert payload["moved"] == ["a.txt", "Docs"]
+    assert payload["share"] == {
+        "status": "failed",
+        "graph_status": 400,
+        "error": "invalid recipient",
+    }
+
+
+@pytest.mark.asyncio
+async def test_transfer_onedrive_rejects_file_with_folder_name():
+    client = _RoutedClient(
+        get_responses=_transfer_routes(
+            **{_FOLDER_PATH: {"id": "x", "name": "Offboarding_Transfer"}}
+        )
+    )
+    payload = await _transfer(client)
+
+    assert payload["error"]["code"] == "invalid_argument"
+    assert client.patch_calls == []
 
 
 @pytest.mark.asyncio

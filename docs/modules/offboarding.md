@@ -1,6 +1,16 @@
-# Module: `src/graph_mcp/tools/offboarding.py` (OneDrive transfer + directory sync)
+# Module: `src/graph_mcp/tools/offboarding.py` (OneDrive archive-and-share + directory sync)
 
 First entry in this module doc — the file itself is new, created by this ticket.
+
+## PRD-20422 rework · 2026-10-16
+
+Supersedes the `graph_transfer_onedrive` notes in the 2026-10-14 entry below; `graph_start_cloud_sync` is unchanged.
+
+- INT test (Tom Lan, 2026-10-16) failed for two reasons. (1) The old `_resolve_drive` caught every `GraphError` and returned `drive_not_found` "No OneDrive provisioned"; INT logs show Graph actually answered **403** on `/users/{id}/drive`. (2) On the delegated `ms-graph` connector the signed-in admin, even a Global Admin, cannot open another user's OneDrive unless they are its site collection admin, and the copy design needed both drives.
+- v1 now follows the Rewst flow Ginko runs (Mandy Du's 2026-10-14 comment): in the **source** OneDrive, find or create `Offboarding_Transfer` (reused by name, never renamed), `PATCH` every other root item into it, then `invite` the recipient (`write`, `requireSignIn`, `sendInvitation`). The recipient's drive is never touched. The parameter is now `recipient_user_id`; `destination_user_id` / `destination_folder_name` are gone.
+- Errors: both users are resolved first (`user_not_found` with `role`); drive 404 is `status: no_onedrive` (a skip, as in Rewst); 401/403 on any drive step is `access_denied` with `step`, `graph_status` and the hint "site collection admin, or use ms-graph-app"; anything else goes through `GraphError.to_envelope()`.
+- Retry: items already inside the folder are not in the root, so a second call only moves what is left; the share is skipped when the folder's permissions already grant the recipient `write`/`owner`. A failed move or failed invite gives `status: partial` with the per-item Graph status.
+- Works on both connectors. `ms-graph-app` with application `Files.ReadWrite.All` needs no per-user setup and is the recommended path for offboarding.
 
 ## PRD-20422 · 2026-10-14
 

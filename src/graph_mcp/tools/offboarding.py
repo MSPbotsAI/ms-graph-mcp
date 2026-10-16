@@ -1,18 +1,27 @@
-"""Offboarding composite tools: OneDrive content transfer and directory
+"""Offboarding composite tools: OneDrive archive-and-share and directory
 synchronization trigger (PRD-20422).
 
-Neither tool has a natural home in users.py/groups.py/sites.py the way
-graph_remove_manager (users.py) is offboarding-specific without living in a
-dedicated "lifecycle" module — one is a cross-drive copy operation, the
-other a directory-sync trigger.
+graph_transfer_onedrive follows the Rewst flow Ginko already runs ("Grant
+OneDrive Sharing Permissions", see Mandy Du's 2026-10-14 comment on
+PRD-20422): everything in the departing user's OneDrive root is moved into
+one archive folder *inside that same OneDrive*, and the folder is shared
+with the recipient. Nothing is copied to the recipient's drive and
+ownership does not change -- the first INT round (copy into the recipient's
+drive) needed access to two drives and failed in real offboarding.
 
-graph_transfer_onedrive is deliberately stateless like every other tool in
-this server (stateless_http=True, server.py) — it has no job id to track
-between calls, so "is it done yet" and "retry" are the same call: each
-invocation re-lists both drives and diffs by name+size, acting only on
-items not already present at the destination.
+Access: Graph answers 403 when the caller cannot open the user's OneDrive.
+That is the normal case on the delegated ms-graph connector -- even a Global
+Admin is not a site collection admin of other people's OneDrives -- so 403
+is reported as access_denied with that hint, never folded into "no
+OneDrive" (the first round did exactly that and hid the cause). The
+app-only ms-graph-app connector with Files.ReadWrite.All has no such limit.
 
-graph_start_cloud_sync only supports Azure AD Connect **cloud sync** — the
+Retry: stateless like every tool here (stateless_http=True, server.py).
+The folder is reused by name, items already inside it are left alone, and
+the share is skipped when the recipient already has it, so calling again
+finishes whatever the previous call left.
+
+graph_start_cloud_sync only supports Azure AD Connect **cloud sync** -- the
 one directory-sync mechanism Microsoft Graph can actually trigger. A tenant
 using classic on-premises AD Connect instead has no Graph API surface for
 this at all; the tool says so explicitly rather than silently doing nothing
@@ -21,6 +30,7 @@ or claiming success (see docs/tickets/PRD-20422.md, AC10/Open Questions).
 
 from collections.abc import Callable
 from typing import Annotated
+from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -41,32 +51,53 @@ from ._common import NO_TOKEN
 _CLOUD_SYNC_AGENT_HOMEPAGE_FRAGMENT = "AD2AADProvisioning"
 _CLOUD_SYNC_JOB_TEMPLATE_ID = "AD2AADProvisioning"
 
+_DEFAULT_ARCHIVE_FOLDER = "Offboarding_Transfer"
+_SHARE_ROLES = {"write", "owner"}
 
-async def _resolve_drive(client: GraphClient, user_id: str, role: str) -> dict | str:
-    """Resolve a user's OneDrive id, or an error_envelope naming which side
-    (source/destination) failed -- AC5/AC7 both fold into the same
-    drive_not_found code, distinguished only by the `role` extra field.
-    """
+_ACCESS_DENIED_HINT = (
+    "The caller cannot open this user's OneDrive. On the delegated ms-graph connector the "
+    "signed-in admin must be a site collection admin of this user's OneDrive (Global Admin "
+    "alone is not enough); or use the ms-graph-app connector with the Files.ReadWrite.All "
+    "application permission."
+)
+
+
+def _access_denied(e: GraphError, step: str) -> str:
+    return error_envelope(
+        "access_denied",
+        _ACCESS_DENIED_HINT,
+        False,
+        extra={"step": step, "graph_status": e.status_code, "graph_message": e.message},
+    )
+
+
+async def _resolve_user(client: GraphClient, user_id: str, role: str) -> dict | str:
     try:
-        drive = await client.get(f"/users/{user_id}/drive", params={"$select": "id,driveType"})
-    except GraphError:
-        return error_envelope(
-            "drive_not_found",
-            f'No OneDrive provisioned for the {role} user "{user_id}".',
-            False,
-            extra={"role": role, "user_id": user_id},
+        user = await client.get(
+            f"/users/{user_id}", params={"$select": "id,mail,userPrincipalName"}
         )
-    return {"id": drive.get("id")}
+    except GraphError as e:
+        if e.status_code == 404:
+            return error_envelope(
+                "user_not_found",
+                f'The {role} user "{user_id}" does not exist in this tenant.',
+                False,
+                extra={"role": role, "user_id": user_id},
+            )
+        return e.to_envelope()
+    return user
 
 
-async def _list_all_children(client: GraphClient, path: str) -> list[dict]:
+async def _list_all_children(
+    client: GraphClient, path: str, select: str | None = None
+) -> list[dict]:
     """Walk every @odata.nextLink page internally -- unlike this repo's
     other list tools (deliberately single-page-per-call), this tool acts on
     every item in one invocation and does not let the caller resume a list.
     """
     items: list[dict] = []
     next_path: str | None = path
-    params: dict | None = {"$select": "id,name,size"}
+    params: dict | None = {"$select": select} if select else None
     while next_path:
         result = await client.get(next_path, params=params)
         items.extend(result.get("value", []) if isinstance(result, dict) else [])
@@ -75,41 +106,25 @@ async def _list_all_children(client: GraphClient, path: str) -> list[dict]:
     return items
 
 
-async def _resolve_or_create_destination_folder(
-    client: GraphClient, dest_drive_id: str, folder_name: str
-) -> dict | str:
-    try:
-        folder = await client.get(
-            f"/drives/{dest_drive_id}/root:/{folder_name}:", params={"$select": "id,name"}
-        )
-        return {"id": folder.get("id"), "name": folder.get("name")}
-    except GraphError as e:
-        if e.status_code != 404:
-            return e.to_envelope()
-    try:
-        folder = await client.post(
-            f"/drives/{dest_drive_id}/root/children",
-            {"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
-        )
-    except GraphError as e:
-        return e.to_envelope()
-    return {"id": folder.get("id"), "name": folder.get("name")}
-
-
-def _rollup_transfer_status(results: list[dict]) -> str:
-    """AC2-AC4's status roll-up: any still-copying item makes the whole
-    call in_progress; all-already-present is completed; all-freshly-started
-    is started; a mix of freshly-started and already-present (no
-    in_progress) is also in_progress -- nothing to report as fully done yet.
-    """
-    actions = {r["action"] for r in results}
-    if "in_progress" in actions:
-        return "in_progress"
-    if actions == {"already_present"}:
-        return "completed"
-    if "already_present" in actions and "copy_started" in actions:
-        return "in_progress"
-    return "started"
+def _recipient_has_access(permissions: list[dict], recipient: dict) -> bool:
+    ids = {recipient.get("id")}
+    emails = {
+        (v or "").lower() for v in (recipient.get("mail"), recipient.get("userPrincipalName")) if v
+    }
+    for perm in permissions:
+        if not _SHARE_ROLES & set(perm.get("roles") or []):
+            continue
+        users = [
+            (perm.get("grantedToV2") or {}).get("user") or {},
+            (perm.get("grantedTo") or {}).get("user") or {},
+        ]
+        users += [(i.get("user") or {}) for i in perm.get("grantedToIdentitiesV2") or []]
+        for u in users:
+            if u.get("id") in ids or (u.get("email") or "").lower() in emails:
+                return True
+        if ((perm.get("invitation") or {}).get("email") or "").lower() in emails:
+            return True
+    return False
 
 
 async def _discover_cloud_sync_service_principal(client: GraphClient) -> dict | str:
@@ -165,101 +180,158 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     async def graph_transfer_onedrive(
         source_user_id: Annotated[
             str,
+            Field(description="Object ID or UPN of the departing user whose OneDrive is archived."),
+        ],
+        recipient_user_id: Annotated[
+            str,
             Field(
-                description="Object ID or UPN of the departing user whose OneDrive content "
-                "is being transferred."
+                description="Object ID or UPN of the user (e.g. the manager) who gets write "
+                "access to the archive folder."
             ),
         ],
-        destination_user_id: Annotated[
-            str, Field(description="Object ID or UPN of the user or admin receiving the content.")
-        ],
-        destination_folder_name: Annotated[
-            str | None,
+        folder_name: Annotated[
+            str,
             Field(
-                description="Name of the top-level folder created in the destination's "
-                'OneDrive root. Defaults to "offboarded-{source_user_id}".'
+                description="Archive folder created in the root of the departing user's "
+                "OneDrive; reused if it already exists."
             ),
-        ] = None,
+        ] = _DEFAULT_ARCHIVE_FOLDER,
     ) -> str:
-        """Copy a departing user's OneDrive root content into a destination
-        user's or admin's OneDrive, for offboarding workflows 08/03.
-
-        Safe to call repeatedly: each call re-lists both drives and only
-        copies items not already present at the destination, so calling it
-        again *is* the status check. Returns started/in_progress/
-        completed/no_content, never a bare boolean. Copies into a new
-        folder -- no ownership transfer, no sharing/version history.
+        """Offboarding: move everything in the departing user's OneDrive root
+        into an archive folder in that same OneDrive and share it with the
+        recipient (write). No copy, no ownership change; the OneDrive is
+        deleted ~30 days after license removal. Status: completed / partial
+        (call again to retry) / no_onedrive / no_content. access_denied: on
+        delegated ms-graph the admin must be site collection admin of that
+        OneDrive, or use ms-graph-app.
         """
         client = client_factory()
         if client is None:
             return NO_TOKEN
 
-        source_drive = await _resolve_drive(client, source_user_id, "source")
-        if isinstance(source_drive, str):
-            return source_drive
+        source = await _resolve_user(client, source_user_id, "source")
+        if isinstance(source, str):
+            return source
+        recipient = await _resolve_user(client, recipient_user_id, "recipient")
+        if isinstance(recipient, str):
+            return recipient
 
-        dest_drive = await _resolve_drive(client, destination_user_id, "destination")
-        if isinstance(dest_drive, str):
-            return dest_drive
-
-        try:
-            source_items = await _list_all_children(
-                client, f"/drives/{source_drive['id']}/root/children"
-            )
-        except GraphError as e:
-            return e.to_envelope()
-
-        if not source_items:
-            return dump_json_capped(
-                {
-                    "source_user_id": source_user_id,
-                    "destination_user_id": destination_user_id,
-                    "status": "no_content",
-                    "items": [],
-                }
-            )
-
-        folder_name = destination_folder_name or f"offboarded-{source_user_id}"
-        dest_folder = await _resolve_or_create_destination_folder(
-            client, dest_drive["id"], folder_name
-        )
-        if isinstance(dest_folder, str):
-            return dest_folder
+        base = {"source_user_id": source_user_id, "recipient_user_id": recipient_user_id}
 
         try:
-            dest_children = await _list_all_children(
-                client, f"/drives/{dest_drive['id']}/items/{dest_folder['id']}/children"
+            drive = await client.get(f"/users/{source['id']}/drive", params={"$select": "id"})
+        except GraphError as e:
+            if e.status_code in (401, 403):
+                return _access_denied(e, "open_drive")
+            if e.status_code == 404:
+                return dump_json_capped(
+                    {
+                        **base,
+                        "status": "no_onedrive",
+                        "reason": "The departing user has no OneDrive; nothing to transfer.",
+                    }
+                )
+            return e.to_envelope()
+        drive_id = drive.get("id")
+
+        try:
+            folder = await client.get(
+                f"/drives/{drive_id}/root:/{quote(folder_name)}:",
+                params={"$select": "id,name,folder"},
             )
         except GraphError as e:
-            return e.to_envelope()
-        dest_by_name = {c.get("name"): c.get("size") for c in dest_children}
+            if e.status_code in (401, 403):
+                return _access_denied(e, "find_folder")
+            if e.status_code != 404:
+                return e.to_envelope()
+            folder = None
+        if folder is not None and "folder" not in folder:
+            return error_envelope(
+                "invalid_argument",
+                f'"{folder_name}" already exists in the OneDrive root and is a file, not a '
+                "folder; pass a different folder_name.",
+                False,
+            )
 
-        results: list[dict] = []
-        for item in source_items:
-            name = item.get("name")
-            size = item.get("size")
-            if name in dest_by_name:
-                if dest_by_name[name] == size:
-                    results.append({"name": name, "size": size, "action": "already_present"})
-                else:
-                    results.append({"name": name, "size": size, "action": "in_progress"})
-                continue
+        try:
+            root_items = await _list_all_children(
+                client, f"/drives/{drive_id}/root/children", "id,name"
+            )
+        except GraphError as e:
+            if e.status_code in (401, 403):
+                return _access_denied(e, "list_root")
+            return e.to_envelope()
+        to_move = [i for i in root_items if folder is None or i.get("id") != folder.get("id")]
+
+        if folder is None and not to_move:
+            return dump_json_capped({**base, "status": "no_content", "moved": [], "failed": []})
+
+        if folder is None:
             try:
-                await client.post(
-                    f"/drives/{source_drive['id']}/items/{item.get('id')}/copy",
-                    {"parentReference": {"driveId": dest_drive["id"], "id": dest_folder["id"]}},
+                folder = await client.post(
+                    f"/drives/{drive_id}/root/children",
+                    {
+                        "name": folder_name,
+                        "folder": {},
+                        "@microsoft.graph.conflictBehavior": "fail",
+                    },
                 )
             except GraphError as e:
+                if e.status_code in (401, 403):
+                    return _access_denied(e, "create_folder")
                 return e.to_envelope()
-            results.append({"name": name, "size": size, "action": "copy_started"})
+        folder_id = folder.get("id")
 
+        moved: list[str] = []
+        failed: list[dict] = []
+        for item in to_move:
+            try:
+                await client.patch(
+                    f"/drives/{drive_id}/items/{item.get('id')}",
+                    {"parentReference": {"id": folder_id}},
+                )
+            except GraphError as e:
+                failed.append(
+                    {"name": item.get("name"), "graph_status": e.status_code, "error": e.message}
+                )
+                continue
+            moved.append(item.get("name"))
+
+        share: dict
+        try:
+            permissions = await _list_all_children(
+                client, f"/drives/{drive_id}/items/{folder_id}/permissions"
+            )
+            if _recipient_has_access(permissions, recipient):
+                share = {"status": "already_shared"}
+            else:
+                email = recipient.get("mail") or recipient.get("userPrincipalName")
+                target = {"email": email} if email else {"objectId": recipient["id"]}
+                await client.post(
+                    f"/drives/{drive_id}/items/{folder_id}/invite",
+                    {
+                        "recipients": [target],
+                        "roles": ["write"],
+                        "requireSignIn": True,
+                        "sendInvitation": True,
+                        "message": "Files from an offboarded user's OneDrive have been shared "
+                        "with you.",
+                    },
+                )
+                share = {"status": "shared", "email": email}
+        except GraphError as e:
+            share = {"status": "failed", "graph_status": e.status_code, "error": e.message}
+
+        status = "completed" if not failed and share["status"] != "failed" else "partial"
         return dump_json_capped(
             {
-                "source_user_id": source_user_id,
-                "destination_user_id": destination_user_id,
-                "destination_folder": dest_folder,
-                "status": _rollup_transfer_status(results),
-                "items": results,
+                **base,
+                "status": status,
+                "folder": {"id": folder_id, "name": folder.get("name") or folder_name},
+                "share": share,
+                "moved_count": len(moved),
+                "failed": failed,
+                "moved": moved,
             }
         )
 
