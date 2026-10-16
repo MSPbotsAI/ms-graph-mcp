@@ -1,0 +1,57 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given a user_id that does not resolve to any Entra ID user, When graph_remove_manager is called, Then it returns a not_found error envelope, never {removed: false, reason: no_manager}",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_remove_manager_nonexistent_user_returns_not_found"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_remove_manager_nonexistent_user_returns_not_found` -> PASSED (full suite: 130/130 passed, 0 regressions vs baseline 126/126; see docs/tickets/PRD-20393-r3.md Self-test section)"
+  },
+  {
+    "id": "TC2",
+    "ac": "AC1",
+    "text": "Given a user_id that resolves to a real user with no manager, When graph_remove_manager is called, Then it still returns {removed: false, previous_manager: null, reason: no_manager} and issues no DELETE, exactly as round 2, even with the new existence check on this path",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_remove_manager_returns_no_manager_without_calling_delete"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_remove_manager_returns_no_manager_without_calling_delete` -> PASSED (full suite: 130/130 passed, 0 regressions vs baseline 126/126; see docs/tickets/PRD-20393-r3.md Self-test section)"
+  },
+  {
+    "id": "TC3",
+    "ac": "AC2",
+    "text": "Given graph_update_user changes user_principal_name and the call succeeds, When the tool reads the user back to build updated, Then it reads back using the NEW upn, not the original user_id",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_update_user_rereads_with_new_upn_after_rename"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_update_user_rereads_with_new_upn_after_rename` -> PASSED (full suite: 130/130 passed, 0 regressions vs baseline 126/126; see docs/tickets/PRD-20393-r3.md Self-test section)"
+  },
+  {
+    "id": "TC4",
+    "ac": "AC2",
+    "text": "Given a graph_update_user call whose PATCH succeeds but whose follow-up read-back fails, When the tool returns, Then it returns {status: success, updated: <sent values>, readback_error: {...}}, never an error envelope",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_update_user_readback_failure_after_patch_still_reports_success"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_update_user_readback_failure_after_patch_still_reports_success` -> PASSED (full suite: 130/130 passed, 0 regressions vs baseline 126/126; see docs/tickets/PRD-20393-r3.md Self-test section)"
+  },
+  {
+    "id": "TC5",
+    "ac": "AC3",
+    "text": "Given graph_update_user's registered tool description, When read, Then it mentions that the returned updated values come from a post-write read-back that can rarely be stale due to Graph replication lag",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_update_user_description_mentions_replication_lag"
+    ],
+    "result": "pass",
+    "evidence": "`uv run pytest -v tests/test_tools.py::test_update_user_description_mentions_replication_lag` -> PASSED (full suite: 130/130 passed, 0 regressions vs baseline 126/126; see docs/tickets/PRD-20393-r3.md Self-test section)"
+  }
+]
