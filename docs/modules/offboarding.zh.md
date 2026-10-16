@@ -1,6 +1,16 @@
-# 模块：`src/graph_mcp/tools/offboarding.py`（OneDrive 转移 + 目录同步）
+# 模块：`src/graph_mcp/tools/offboarding.py`（OneDrive 归档共享 + 目录同步）
 
 本模块文档的第一条记录——文件本身就是本单新建的。
+
+## PRD-20422 返工 · 2026-10-16
+
+替代下面 2026-10-14 那条里关于 `graph_transfer_onedrive` 的说明；`graph_start_cloud_sync` 没变。
+
+- INT 测试（Tom Lan，2026-10-16）没过，两个原因：(1) 旧的 `_resolve_drive` 吞掉所有 `GraphError`，一律返回 `drive_not_found`「No OneDrive provisioned」，INT 日志里 Graph 对 `/users/{id}/drive` 实际返回的是 **403**；(2) 委托的 `ms-graph` 连接器下，登录的管理员（哪怕是全局管理员）不是对方 OneDrive 的网站集管理员就打不开，而复制方案要同时访问两个 drive。
+- v1 改成 Ginko 在用的 Rewst 做法（Mandy Du 2026-10-14 的评论）：在**离职用户自己的** OneDrive 里找到或新建 `Offboarding_Transfer`（按名字复用，不改名），把根目录其它项逐个 `PATCH` 移进去，再 `invite` 接收人（`write`、`requireSignIn`、`sendInvitation`）。不碰接收人的 drive。参数改为 `recipient_user_id`，去掉了 `destination_user_id` / `destination_folder_name`。
+- 错误：先解析两个用户（`user_not_found`，带 `role`）；drive 404 返回 `status: no_onedrive`（跳过，和 Rewst 一致）；各 drive 步骤的 401/403 返回 `access_denied`，带 `step`、`graph_status` 和提示「加网站集管理员，或改用 ms-graph-app」；其它错误走 `GraphError.to_envelope()`。
+- 重试：已经移进文件夹的不在根目录里，再调一次只移剩下的；文件夹权限里接收人已有 `write`/`owner` 就不再邀请。有项移动失败或邀请失败时返回 `status: partial`，逐项带 Graph 状态码。
+- 两种连接器都能用。`ms-graph-app` 授予应用权限 `Files.ReadWrite.All` 后不用逐个用户配置，离职场景推荐用它。
 
 ## PRD-20422 · 2026-10-14
 
