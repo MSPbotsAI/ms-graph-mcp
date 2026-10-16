@@ -569,12 +569,12 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     ) -> str:
         """Update attributes on an existing Entra ID user.
 
-        Only the fields you provide are changed. Setting account_enabled=False
-        blocks new sign-ins immediately, but sessions issued before the change
-        stay valid until they expire or are revoked with graph_revoke_sessions.
-        A user_principal_name change is rejected up front if its domain is
-        not verified for this tenant; use graph_remove_manager separately to
-        clear a manager, not this tool.
+        Only the fields you provide are changed. account_enabled=False
+        blocks sign-ins immediately; sessions stay valid until revoked via
+        graph_revoke_sessions. user_principal_name is rejected if its
+        domain isn't verified; use graph_remove_manager for a manager, not
+        this tool. `updated` is a post-write read-back; Graph replication
+        lag can rarely leave it stale -- retry via graph_get_user.
         """
         client = client_factory()
         if client is None:
@@ -662,18 +662,42 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         try:
             await client.patch(f"/users/{user_id}", body)
-            # Re-read the changed fields so `updated` reflects what Graph
-            # actually stored (e.g. a cleared field reads back as null),
-            # not just the key names we sent (PRD-20393 round 2, Defect 2).
-            readback = await client.get(
-                f"/users/{user_id}", params={"$select": ",".join(body.keys())}
-            )
-            updated = {key: readback.get(key) for key in body}
-            return dump_json_capped(
-                {"status": "success", "user_id": user_id, "updated": updated}
-            )
         except GraphError as e:
             return e.to_envelope()
+
+        # Re-read the changed fields so `updated` reflects what Graph
+        # actually stored (e.g. a cleared field reads back as null), not
+        # just the key names we sent (PRD-20393 round 2, Defect 2). If the
+        # PATCH itself renamed the UPN, the old user_id -- when user_id was
+        # that same old UPN string, not a GUID -- no longer resolves once
+        # the rename has taken effect, so read back with the new UPN
+        # instead (PRD-20393 round 3, Fix 2a). A GUID user_id, or a PATCH
+        # that didn't touch userPrincipalName, is unaffected by this.
+        readback_id = body.get("userPrincipalName", user_id)
+        try:
+            readback = await client.get(
+                f"/users/{readback_id}", params={"$select": ",".join(body.keys())}
+            )
+        except GraphError as e:
+            # The PATCH already succeeded at this point -- a failing
+            # read-back (replication lag, or an id/UPN that stopped
+            # resolving) must not be reported as the whole call failing
+            # (PRD-20393 round 3, Fix 2b). Echo back the values we sent and
+            # flag the read-back failure explicitly instead of returning an
+            # error envelope for a write that actually went through.
+            return dump_json_capped(
+                {
+                    "status": "success",
+                    "user_id": user_id,
+                    "updated": dict(body),
+                    "readback_error": {"status_code": e.status_code, "message": e.message},
+                }
+            )
+
+        updated = {key: readback.get(key) for key in body}
+        return dump_json_capped(
+            {"status": "success", "user_id": user_id, "updated": updated}
+        )
 
     @mcp.tool(
         annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
@@ -713,9 +737,10 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
 
         Use during offboarding to clear the manager relationship. A user
         with no manager set is not an error: removed=false,
-        reason="no_manager". Returns {"user_id", "removed": bool,
-        "previous_manager": {id, display_name, user_principal_name} | null,
-        "reason": "no_manager" | null}.
+        reason="no_manager". A user_id that does not resolve to any user is
+        a not_found error, never a no_manager result. Returns {"user_id",
+        "removed": bool, "previous_manager": {id, display_name,
+        user_principal_name} | null, "reason": "no_manager" | null}.
         """
         client = client_factory()
         if client is None:
@@ -733,6 +758,16 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
             )
         except GraphError as e:
             if e.status_code == 404:
+                # Graph 404s GET /manager both when the user has no manager
+                # and when user_id does not resolve to any user at all --
+                # disambiguate with a direct existence check before
+                # reporting no_manager (PRD-20393 round 3, Fix 1). A caller
+                # with a mistyped/stale user_id must get a not_found error,
+                # not a silent "succeeded, no manager".
+                try:
+                    await client.get(f"/users/{user_id}", params={"$select": "id"})
+                except GraphError as exist_err:
+                    return exist_err.to_envelope()
                 return dump_json_capped(
                     {
                         "user_id": user_id,

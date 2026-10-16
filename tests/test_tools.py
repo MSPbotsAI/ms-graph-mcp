@@ -1684,6 +1684,111 @@ async def test_update_user_returns_rereads_changed_values():
     }
 
 
+class _UpdateUserReadbackClient:
+    """GraphClient stand-in for graph_update_user's full write sequence
+    (PRD-20393 round 3): an optional verified-domains GET (only issued when
+    user_principal_name is being changed), then PATCH, then a read-back
+    GET. GET outcomes are consumed from `get_queue` in call order -- each
+    item is either a dict (returned) or a GraphError (raised) -- so a test
+    can make the read-back call fail independently of the domains check or
+    the PATCH itself. PATCH always succeeds."""
+
+    def __init__(self, get_queue: list):
+        self._get_queue = list(get_queue)
+        self.methods: list[str] = []
+        self.calls: list[tuple[str, dict]] = []
+        self.bodies: list[dict] = []
+
+    async def get(self, path: str, params: dict | None = None, extra_headers: dict | None = None):
+        self.methods.append("GET")
+        self.calls.append((path, params or {}))
+        item = self._get_queue.pop(0)
+        if isinstance(item, GraphError):
+            raise item
+        return item
+
+    async def patch(self, path: str, body: dict | None = None):
+        self.methods.append("PATCH")
+        self.calls.append((path, {}))
+        self.bodies.append(body or {})
+        return None
+
+
+@pytest.mark.asyncio
+async def test_update_user_rereads_with_new_upn_after_rename():
+    """Fix 2a (PRD-20393 round 3, high risk found in code review): once the
+    PATCH renames userPrincipalName, the OLD UPN -- when user_id was passed
+    as that old UPN string rather than a GUID -- no longer resolves. The
+    follow-up read-back must target the NEW UPN, not user_id, or a
+    workflow-08-style UPN rename would report an error for a write that
+    had already succeeded."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    mcp = FastMCP(name="test")
+    client = _UpdateUserReadbackClient(
+        get_queue=[
+            {"value": [{"id": "newdomain.com", "isVerified": True}]},  # /domains check
+            {"userPrincipalName": "alice@newdomain.com"},  # read-back, by the NEW upn
+        ]
+    )
+    users.register(mcp, lambda: client)
+
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_update_user",
+                {"user_id": "alice@contoso.com", "user_principal_name": "alice@newdomain.com"},
+            )
+        )[0][0].text
+    )
+
+    assert client.methods == ["GET", "PATCH", "GET"]
+    # The read-back (3rd call) must use the new UPN, never the old user_id
+    # the caller passed in -- that old UPN stopped resolving once the
+    # PATCH took effect.
+    assert client.calls[2][0] == "/users/alice@newdomain.com"
+    assert result == {
+        "status": "success",
+        "user_id": "alice@contoso.com",
+        "updated": {"userPrincipalName": "alice@newdomain.com"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_user_readback_failure_after_patch_still_reports_success():
+    """Fix 2b (PRD-20393 round 3, high risk found in code review, could not
+    be exercised on INT): if the PATCH succeeds but the follow-up read-back
+    fails (replication lag, or an id/UPN that stopped resolving), the call
+    must not come back as an error envelope -- the write already went
+    through. Echo back the values that were sent and surface the read-back
+    failure separately via `readback_error`."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    mcp = FastMCP(name="test")
+    client = _UpdateUserReadbackClient(get_queue=[GraphError(404, "Resource not found")])
+    users.register(mcp, lambda: client)
+
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_update_user", {"user_id": "u1", "job_title": "Interface Test"}
+            )
+        )[0][0].text
+    )
+
+    assert client.methods == ["PATCH", "GET"]
+    assert result == {
+        "status": "success",
+        "user_id": "u1",
+        "updated": {"jobTitle": "Interface Test"},
+        "readback_error": {"status_code": 404, "message": "Resource not found"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_remove_manager_returns_previous_manager_when_present():
     """AC3/TC3 (PRD-20393 round 2, Defect 3 fix): removing a user's manager
@@ -1725,26 +1830,41 @@ class _ManagerRemovalClient:
     """GraphClient stand-in for graph_remove_manager's read-then-maybe-delete
     sequence (PRD-20393 round 2): the GET can return a manager or raise a
     GraphError, and the DELETE (only reached when the GET found a manager)
-    can succeed or itself raise (the AC7 concurrent-removal race)."""
+    can succeed or itself raise (the AC7 concurrent-removal race).
+
+    Round 3 (Fix 1) added a second, distinct GET: when the manager GET
+    404s, the tool issues a plain /users/{id} existence check before
+    deciding between no_manager and not_found. `exists_error`/`exists_result`
+    control that second call independently of `get_error`/`get_result`,
+    keyed off the request path (".../manager" vs plain ".../{id}")."""
 
     def __init__(
         self,
         get_result: dict | None = None,
         get_error: GraphError | None = None,
         delete_error: GraphError | None = None,
+        exists_result: dict | None = None,
+        exists_error: GraphError | None = None,
     ):
         self._get_result = get_result
         self._get_error = get_error
         self._delete_error = delete_error
+        self._exists_result = exists_result if exists_result is not None else {"id": "u1"}
+        self._exists_error = exists_error
         self.methods: list[str] = []
         self.calls: list[tuple[str, dict]] = []
 
     async def get(self, path: str, params: dict | None = None, extra_headers: dict | None = None):
         self.methods.append("GET")
         self.calls.append((path, params or {}))
-        if self._get_error is not None:
-            raise self._get_error
-        return self._get_result
+        if path.endswith("/manager"):
+            if self._get_error is not None:
+                raise self._get_error
+            return self._get_result
+        # The round-3 existence check (plain /users/{id}, no /manager suffix).
+        if self._exists_error is not None:
+            raise self._exists_error
+        return self._exists_result
 
     async def delete(self, path: str):
         self.methods.append("DELETE")
@@ -1762,7 +1882,12 @@ async def test_remove_manager_returns_no_manager_without_calling_delete():
     DELETE and relied on a second-404-means-no-manager assumption that
     acceptance proved does not hold against a real tenant (a repeat DELETE
     on an already-managerless user does not 404). Calling it twice is
-    equally successful -- idempotent without ever touching DELETE."""
+    equally successful -- idempotent without ever touching DELETE.
+
+    Round 3 (Fix 1) added a plain /users/{id} existence check on this same
+    path (the user does exist here, so it succeeds and the result is still
+    no_manager) -- see test_remove_manager_nonexistent_user_returns_not_found
+    for the case where that existence check itself 404s."""
     from mcp.server.fastmcp import FastMCP
 
     from graph_mcp.tools import users
@@ -1781,14 +1906,55 @@ async def test_remove_manager_returns_no_manager_without_calling_delete():
         (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
     )
     assert result == expected
-    assert client.methods == ["GET"]
+    assert client.methods == ["GET", "GET"]
+    assert client.calls[0][0] == "/users/u1/manager"
+    assert client.calls[1][0] == "/users/u1"
 
     # Calling again is equally successful, and still never reaches DELETE.
     result2 = json.loads(
         (await mcp.call_tool("graph_remove_manager", {"user_id": "u1"}))[0][0].text
     )
     assert result2 == expected
+    assert client.methods == ["GET", "GET", "GET", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_remove_manager_nonexistent_user_returns_not_found():
+    """Fix 1 (PRD-20393 round 3, defect confirmed on INT): Graph 404s
+    GET .../manager both when the user has no manager and when user_id
+    does not resolve to any user at all. Round 1/2's code treated every
+    404 there as no_manager, so a mistyped/stale user_id silently
+    "succeeded" and reported no_manager instead of erroring -- workflow 08
+    could record a wrong-but-successful-looking outcome for a typo.
+
+    Repro (from comment 90170263295399): graph_remove_manager with
+    user_id="nonexistent.qa20393@mspbots.ai" must return a not_found error
+    envelope, never {"removed": false, "reason": "no_manager"}."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    mcp = FastMCP(name="test")
+    client = _ManagerRemovalClient(
+        get_error=GraphError(404, "no manager"),
+        exists_error=GraphError(404, "Request_ResourceNotFound"),
+    )
+    users.register(mcp, lambda: client)
+
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_remove_manager", {"user_id": "nonexistent.qa20393@mspbots.ai"}
+            )
+        )[0][0].text
+    )
+
     assert client.methods == ["GET", "GET"]
+    assert client.calls[0][0] == "/users/nonexistent.qa20393@mspbots.ai/manager"
+    assert client.calls[1][0] == "/users/nonexistent.qa20393@mspbots.ai"
+    assert result["error"]["code"] == "not_found"
+    assert "removed" not in result
+    assert "reason" not in result
 
 
 @pytest.mark.asyncio
@@ -1967,6 +2133,28 @@ async def test_update_user_still_rejects_when_nothing_to_update():
 
     assert client.calls == []
     assert json.loads(result[0][0].text)["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_update_user_description_mentions_replication_lag():
+    """Minor fix (PRD-20393 round 3, optional): a read-back right after the
+    PATCH can show a stale value because of Graph replication lag. Chosen
+    fix is documenting this in the tool description (a retry was the other
+    option offered, see docs/tickets/PRD-20393-r3.md Tech design, Option
+    analysis) -- this test makes that documentation a checked fact instead
+    of an eyeballed one, since the docstring itself has no other test
+    coverage."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import users
+
+    mcp = FastMCP(name="test")
+    users.register(mcp, lambda: None)
+    tools = await mcp.list_tools()
+    by_name = {t.name: t for t in tools}
+
+    description = " ".join((by_name["graph_update_user"].description or "").split())
+    assert "replication lag" in description
 
 
 @pytest.mark.asyncio
