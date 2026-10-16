@@ -4,7 +4,7 @@ Microsoft Graph MCP server — exposes Azure Entra ID user, group, and license m
 
 ## Overview
 
-This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) (HTTP-SSE transport) and wraps the Microsoft Graph API. It exposes 32 tools spanning user management (create / read / update / disable, password reset, session revocation, manager assignment, MFA method listing), group membership and ownership (add / remove / list / search, owned-groups orphan check), license inventory and assignment, reading/searching a mailbox and sending mail, SharePoint sites/document libraries (find a site, browse a document library, create/read/write/delete small text files), Intune-managed devices (list / remove a user's enrolled devices), and calendar (list events in a time window, check free/busy across mailboxes, create and cancel events). It is designed for **gateway mode**: the caller obtains an Azure access token via OAuth and passes it per-request through a header. The server itself holds no credentials.
+This server implements the [Model Context Protocol](https://modelcontextprotocol.io/) (HTTP-SSE transport) and wraps the Microsoft Graph API. It exposes 41 tools (count last updated PRD-20422 — this line had already drifted to 39 before this ticket; not something this ticket introduced) spanning user management (create / read / update / disable, password reset, session revocation, manager assignment, MFA method listing), group membership and ownership (add / remove / list / search, owned-groups orphan check), license inventory and assignment, reading/searching a mailbox and sending mail, SharePoint sites/document libraries (find a site, browse a document library, create/read/write/delete small text files), Intune-managed devices (list / remove a user's enrolled devices), calendar (list events in a time window, check free/busy across mailboxes, create and cancel events), and offboarding composites (transfer a departing user's OneDrive content, start the tenant's directory synchronization). It is designed for **gateway mode**: the caller obtains an Azure access token via OAuth and passes it per-request through a header. The server itself holds no credentials.
 
 ## Quick Start
 
@@ -99,6 +99,8 @@ Connect your MCP client with:
 | `graph_delete_file` | 永久删除一个文件（进站点回收站，跟SharePoint网页里删除等效）；幂等，删一个已经不存在的item id也返回成功 | `Sites.ReadWrite.All`（够用，无需额外加`Files.ReadWrite.All`——见下方说明） |
 | `graph_list_managed_devices` | 列出用户的 Intune 托管设备；租户没开 Intune license 时不报错，返回空列表 | `DeviceManagementManagedDevices.Read.All` |
 | `graph_remove_managed_device` | 永久删除一个设备的 Intune 管理记录（不是选择性的公司数据擦除/retire，是直接删记录）；幂等，删已经不存在的device id也返回成功 | `DeviceManagementManagedDevices.ReadWrite.All` |
+| `graph_transfer_onedrive` | 离职流程用：把一个即将离职用户 OneDrive 根目录下的内容复制进目标用户/管理员 OneDrive 的一个新建文件夹（同名同大小视为已存在，不重复复制）；无状态，重复调用本身就是查进度，返回 `started`/`in_progress`/`completed`/`no_content`，不是裸布尔值（PRD-20422，deferred from PRD-20393 item 7） | `Files.ReadWrite.All`（已申请但此前无工具使用，见下方说明） |
+| `graph_start_cloud_sync` | 离职流程用：触发该租户的 Azure AD Connect 云同步（cloud sync）任务；只支持云同步机制——经典本地 AD Connect 没有可调用的 Graph 接口，该情形会返回 `no_sync_job_configured` 并指出需要在 Connect 服务器上手动跑 `Start-ADSyncSyncCycle`，不会假装成功或静默不做；云账号（`onPremisesSyncEnabled=false`）返回 `not_applicable`（非错误）（PRD-20422，deferred from PRD-20393 item 8） | `Synchronization.ReadWrite.All`（新增，见下方说明） |
 | `graph_list_calendar_events` | 查询某个用户某段时间窗口内的日历事件（`calendarView`，重复性会议会展开成一个个实例）；结果只取第一页，窗口太大就自己缩窗口，别加大 limit | `Calendars.Read`（读别人的日历：app-only 权限，或委派下该日历已共享给调用者，见 `Calendars.Read.Shared`） |
 | `graph_get_user_availability` | 一次查最多 20 个邮箱的 free/busy（`getSchedule`），返回每人一串 availabilityView（0空闲 1暂定 2忙 3外出 4在别处办公）+ 工作时间；排会先用它找空档，比逐个读日历更省也更少侵犯隐私 | `Calendars.Read` |
 | `graph_create_calendar_event` | 建日历事件，可带必选/可选与会者、地点、正文、提醒，`is_online_meeting=true` 会挂一个 Teams 会议并把 joinUrl 返回；**调用即刻发出邀请**，不可撤回，只能事后取消 | `Calendars.ReadWrite`（在别人日历上建：app-only 权限，或委派下 `Calendars.ReadWrite.Shared`） |
@@ -106,7 +108,7 @@ Connect your MCP client with:
 
 > **权限说明**：本文件里所有 SharePoint 工具全部只调用 Graph 的 `/sites/*` 和 `/drives/*` 端点，从不触碰 `/me/drive` 或 `/users/{id}/drive`。这类站点文档库驱动器接口，`Sites.*` 和 `Files.*` 是二选一的替代权限组，不是叠加要求——所以只需要 `Sites.Read.All`（只读工具）+ `Sites.ReadWrite.All`（写/建/删工具），完全不需要额外申请 `Files.ReadWrite.All`。
 
-> **实际申请的 scope**：上表逐个工具列的是各端点**最小**受理权限，便于按需裁剪；平台侧（MCP-Management-Service 的 `auth/oauth/vendors/msgraph.py`）实际向 Entra 申请的是能覆盖全部 32 个工具的并集：
+> **实际申请的 scope**：上表逐个工具列的是各端点**最小**受理权限，便于按需裁剪；平台侧（MCP-Management-Service 的 `auth/oauth/vendors/msgraph.py`）实际向 Entra 申请的是能覆盖全部 41 个工具的并集：
 >
 > ```
 > offline_access openid profile
@@ -116,11 +118,14 @@ Connect your MCP client with:
 > Sites.ReadWrite.All Files.Read.All Files.ReadWrite.All
 > DeviceManagementManagedDevices.ReadWrite.All
 > Calendars.ReadWrite Calendars.ReadWrite.Shared
+> Synchronization.ReadWrite.All
 > ```
 >
 > 其中 `User.ReadWrite.All` 覆盖建/改用户、改密、分配许可、注销会话（这些端点各自的最小权限分散在 `User-PasswordProfile.ReadWrite.All`、`User.EnableDisableAccount.All`、`LicenseAssignment.ReadWrite.All`、`User.RevokeSessions.All`，用一条覆盖比申请五条更诚实）；`Sites.ReadWrite.All` 包含 `Sites.Read.All` 故不重复列；`DeviceManagementManagedDevices.ReadWrite.All` 同理包含 `.Read.All`，覆盖 `graph_list_managed_devices` + `graph_remove_managed_device` 两个工具；**不申请** `Directory.Read.All`（没有工具需要通读目录）和 `Group.ReadWrite.All`（没有工具建组/删组/改组属性）。
 >
-> `Files.Read.All` / `Files.ReadWrite.All` 是运维决定一并申请的：如上一条所述，对本文件用到的 `/sites/*`、`/drives/*` 端点，`Files.*` 与 `Sites.*` 是**二选一**的替代权限组，工具本身不需要它——加上是为了让"管理员只同意了其中一组"的租户也能落到可用状态。代价是 `Files.*` 同时覆盖每个用户的 OneDrive，而这里没有任何工具会去碰它。
+> `Files.Read.All` / `Files.ReadWrite.All` 是运维决定一并申请的：如上一条所述，对本文件用到的 `/sites/*`、`/drives/*` 端点，`Files.*` 与 `Sites.*` 是**二选一**的替代权限组，SharePoint 工具本身不需要它——加上是为了让"管理员只同意了其中一组"的租户也能落到可用状态。代价是 `Files.*` 同时覆盖每个用户的 OneDrive——`graph_transfer_onedrive`（PRD-20422）是本仓库第一个真正用到这部分权限的工具，此前只是防御性申请、从未被实际使用。
+>
+> `Synchronization.ReadWrite.All` 是 `graph_start_cloud_sync`（PRD-20422）新增的权限请求，覆盖 `/servicePrincipals/{id}/synchronization/jobs` 的发现与 `/start` 调用；已连接的租户要先重新 authorize 才能拿到它，在此之前调用这个工具会返回 `unauthorized`，和 Mail/Calendar 那两组新增权限已经记录的上线路径完全同构（见下文）。
 
 > `Mail.Read` 覆盖 `graph_list_messages` / `graph_get_message` 两个读邮件工具，语义上和日历那一组完全同构：委派的 `Mail.Read` 只授权**登录者自己**的邮箱，读别人的邮箱要 `Mail.Read.Shared` **并且**那个邮箱在 Exchange 侧确实共享/委派给了登录者——光有 scope 不够，这是两道独立的门。委派模式下不存在"租户内任意邮箱都能读"这一档；那是 app-only（`ms-graph-app`）的应用权限 `Mail.Read`，它一次就覆盖租户里**每一个**邮箱，放权前建议用 Exchange 的 application access policy 把可访问邮箱限定到一个安全组，而不是裸开。另外**不申请** `Mail.ReadWrite`（没有工具改邮件、移动邮件或标记已读）和 `Mail.ReadBasic`（它读不到正文，`graph_get_message` 就没意义了）。
 
@@ -173,6 +178,7 @@ Scheduling（排会）：
 - **读邮件工具（`graph_list_messages`/`graph_get_message`）尚未在真实已同意租户上跑通**（PRD-19103，2026-09-23 交付），卡点与日历那一批完全相同：平台侧 `msgraph.py` 已把 `Mail.Read` 加进委派 scope，但 MSPbots 共享 Entra 应用的 API permissions 还要人工加上、且**已授权租户必须重新授权**才会拿到新权限（`msgraph.py` 文件头注释写明了这一点：租户在重新 authorize 之前一直跑在旧 grant 上）。在此之前调用这两个工具会返回 `unauthorized`——而这个报错和"工具压根不存在"在 agent 那边看起来是一样的，排查时先确认租户的授权时间晚于 scope 变更时间。
 - **日历工具（`graph_list_calendar_events`/`graph_get_user_availability`/`graph_create_calendar_event`/`graph_cancel_calendar_event`）尚未在真实已同意租户上跑通**（PRD-18631，2026-09-10 交付）：平台侧 `msgraph.py` 已把 `Calendars.ReadWrite`/`Calendars.ReadWrite.Shared` 加进委派 scope，但 MSPbots 共享 Entra 应用的 API permissions 还要人工加上、且已授权租户必须重新授权才会拿到新权限；app-only 侧则要客户自己在应用注册里加应用权限 `Calendars.ReadWrite` 并 grant admin consent。在此之前调用这几个工具会返回 `unauthorized`。
 - **日历工具刻意不做改期（PATCH）、与会者回复状态查询、重复性规则编辑、会议室/设备资源预订**：排会闭环用不到，加进来只会稀释 agent 的选工具准确率。要改期目前只能取消后重建。
+- **`graph_transfer_onedrive`/`graph_start_cloud_sync` 尚未在真实已同意租户上跑通**（PRD-20422，deferred from PRD-20393 items 7-8）：单元测试已覆盖全部 11 条自动用例（fake client，无真实网络调用），但没有一次真实 Graph 调用——`graph_start_cloud_sync` 的服务主体/同步任务发现过滤条件（`homepage` 含 `AD2AADProvisioning` 且 `accountEnabled`；任务 `templateId` 匹配且 `schedule.state == Active`）来自 Mandy Du 在该工单上提供的 Rewst 实现证据，不是对着 Microsoft 官方文档逐条核对过的，上线前建议先在一个确认使用 Azure AD Connect cloud sync 的测试租户上跑一遍。`graph_start_cloud_sync` 还要等 `Synchronization.ReadWrite.All` 走完平台侧授权流程（同 Mail/Calendar 的已授权租户重新 authorize 路径）才会在已连接租户上生效；在此之前调用会返回 `unauthorized`。本工单假设该租户群组使用的是云同步而非经典本地 AD Connect——如果不是，`graph_start_cloud_sync` 整个工具都不可行，见 `docs/tickets/PRD-20422.md` 的 Open Questions。
 
 ## Sovereign Cloud Support
 

@@ -7,3 +7,4 @@
 | `src/graph_mcp/tools/users.py` | [users.zh.md](users.zh.md)（[English](users.md)） |
 | `src/graph_mcp/tools/groups.py` | [groups.zh.md](groups.zh.md)（[English](groups.md)） |
 | `src/graph_mcp/tools/sites.py` | [sites.zh.md](sites.zh.md)（[English](sites.md)） |
+| `src/graph_mcp/tools/offboarding.py` | [offboarding.zh.md](offboarding.zh.md)（[English](offboarding.md)） |
