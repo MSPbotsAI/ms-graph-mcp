@@ -1,0 +1,74 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given the Monthly Technology Report agent for American Ambulance of Visalia, When a new thread asks it to generate and email the September 2026 report to mspbots_reports@emdnet.com, Then the received email's attachment is byte-identical to monthly-technology-report_american-ambulance-of-visalia_2026-09.html (~57 KB), not a placeholder",
+    "type": "manual",
+    "steps": [
+      "Open the Monthly Technology Report agent (sopId=41) and start a new thread in chat",
+      "Send: \"Generate the September 2026 monthly technology report for American Ambulance and email it to mspbots_reports@emdnet.com.\"",
+      "Let the run complete (all three page agents, Executive Brief, Action Register, bind, send)",
+      "Check the email received at mspbots_reports@emdnet.com",
+      "Compare the attachment's bytes/sha256 against the report artifact the run itself produced"
+    ],
+    "expect": "The email's attachment is byte-identical to the generated monthly-technology-report_american-ambulance-of-visalia_2026-09.html (~57 KB); it is not a placeholder HTML file",
+    "result": "untested",
+    "evidence": "",
+    "notes": "This is the actual bug repro from PRD-20703/PRD-20707. Not executed by the design leg -- no live agent/mailbox session available in this sandbox (see doc Open Questions). This is the only case that confirms whether the SOP agent has switched to the content_url path after the PRD-20707 fix; TC2-TC8 only confirm the ms-graph-mcp mechanism in isolation."
+  },
+  {
+    "id": "TC2",
+    "ac": "AC1",
+    "text": "Given graph_send_mail is called with attachments=[{content_url: <https link>}], When the host is allow-listed and the fetch succeeds, Then the attachment delivered matches the fetched bytes exactly (same sha256)",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_attaches_exact_fetched_bytes"]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC2",
+    "text": "Given a content_url fetch fails (non-200 response or network error), When graph_send_mail is called, Then no email is sent at all",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_send_mail_content_url_fetch_failure_sends_nothing",
+      "tests/test_tools.py::test_send_mail_content_url_network_error_sends_nothing"
+    ]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC2",
+    "text": "Given a content_url file exceeds the 2.5 MB per-file cap, When graph_send_mail is called, Then the attachment is rejected and nothing is sent (not truncated into a smaller wrong file)",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_over_per_file_limit"]
+  },
+  {
+    "id": "TC5",
+    "ac": "AC3",
+    "text": "Given a content_url host that is not on the configured allow-list, When graph_send_mail is called, Then the host is rejected before any network request is made",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_rejects_disallowed_urls_without_fetching"]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC3",
+    "text": "Given the allow-list is configured empty, When a content_url attachment is supplied, Then content_url is disabled entirely (not \"allow all\")",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_content_url_disabled_when_allow_list_empty"]
+  },
+  {
+    "id": "TC7",
+    "ac": "AC4",
+    "text": "Given an inline attachment (content_text/content_base64) over the pre-existing 500 KB per-file or 700 KB combined caps, When graph_send_mail is called, Then it is rejected exactly as before this fix -- the new content_url path does not change inline behavior",
+    "type": "auto",
+    "tests": [
+      "tests/test_tools.py::test_send_mail_rejects_attachment_over_500kb",
+      "tests/test_tools.py::test_send_mail_rejects_attachments_over_700kb_total"
+    ]
+  },
+  {
+    "id": "TC8",
+    "ac": "AC4",
+    "text": "Given two sequential graph_send_mail calls with different inline attachments, When the second call is made, Then no state from the first call's attachments leaks into it",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_send_mail_attachments_do_not_leak_across_calls"]
+  }
+]
