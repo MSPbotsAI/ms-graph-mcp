@@ -24,3 +24,11 @@
 - 自身不做任何审批流程——工单原话"Teams 只有经过批准才设为所有者"描述的是一个在调用这个工具**之前**就要完成的 SOP 级步骤；按设计排除在范围之外（见 `docs/tickets/PRD-20480.md` § Non-goals）。
 - 测试覆盖：`tests/test_tools.py::test_graph_add_group_owner_adds_new_owner`、`::test_graph_add_group_owner_is_idempotent_for_existing_owner`（均为本单新增，在 `ad9f0e2` 上全部通过）。
 - 自动化测试未覆盖的部分（需要真实租户——见 `docs/tickets/PRD-20480.md` § 自测，TC-MSG-005b）：Graph 实际的"已是 owner"错误文本是否和 mock 的 400 处理假设一致（和 `graph_assign_groups` 自己当初钉死 `already exist` 匹配时是同一类开放问题）。另外还依赖上面 `users.md` 条目里记的、`graph_create_tap` 同款的 `Group.ReadWrite.All` 跨仓库 scope 授权排期。
+
+## PRD-20480-r2 · 2026-10-19（取代上面的 PRD-20480 记录）
+
+- INT 测试（comment `90170264109063`，Minnie Zhou，2026-10-19）发现 `graph_add_group_owner` 在 `user_id` 传 UPN 而不是 object id 时会报"Invalid object identifier"——本单范围内其它所有面向用户的工具都接受 UPN，这是唯一不一致的一个。修复方式（`src/graph_mcp/tools/groups.py` @ `a6e904a`）：构造 `owners/$ref` 请求体之前先 `GET /users/{user_id}?$select=id` 解析，照搬同一文件里几个函数之后 `graph_list_owned_groups` 已经在用的写法。如果这次查找本身失败，或者没有返回 `id`，工具现在会在调用 `owners/$ref` 之前就返回。
+- 成功/已是所有者响应里的 `user_id` 现在是**解析后**的 object id，不再是调用方传入的原值（不论是 UPN 还是 id）——如果有地方按原样回显去解析这个字段，这是一个值得注意的返回形状变化。
+- 另外修复：除"已存在"之外的所有失败现在都返回 `GraphError.to_envelope()`（本仓别处统一用的 `{"code", "message", "retryable"}` 标准形状），不再是修复前那种自造的 `{"status": "error", "detail": ...}`——Minnie 的 comment 专门指出这和"其它工具用的错误信封"不一致。
+- 测试覆盖：`tests/test_tools.py::test_graph_add_group_owner_adds_new_owner` 与 `::test_graph_add_group_owner_is_idempotent_for_existing_owner` 因新的 GET-then-POST 调用序列而更新（判定句不变）；新增：`::test_graph_add_group_owner_resolves_upn_before_posting`、`::test_graph_add_group_owner_unresolvable_user_returns_not_found_without_posting`、`::test_graph_add_group_owner_user_lookup_error_returns_standard_envelope`、`::test_graph_add_group_owner_other_post_failure_uses_standard_envelope`。
+- `tests/test_tools.py` 里共用的 `_CapturingClient`/`_register` 测试辅助工具新增了一个可选的 `get_result` 参数，让"先 GET 再 POST"的工具的两次调用能返回不同的预设值——这里需要它是因为原来的 `_CapturingClient` 只有一个 `_result` 被所有动词共用。不传时会退回跟踪 `_result`，所以每个在构造后改写 `client._result` 的既有测试都不受影响（已通过重跑整套测试确认，零回归）。以后任何"先读后写"的工具都可以复用这个辅助工具。
