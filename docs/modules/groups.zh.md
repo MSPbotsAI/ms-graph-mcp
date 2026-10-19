@@ -17,3 +17,10 @@
 - 对本文件未来修复多态 Graph 导航属性分页问题的先例：**优先在请求 URL 里做 OData 类型转型，而不是在客户端做后置过滤**——后置过滤会悄悄让「被过滤的集合」和「分页游标」脱钩，这正是本次缺陷的成因。
 - 测试覆盖：`tests/test_tools.py::test_list_user_groups_paginates_with_skiptoken`（改写为断言转型后的 URL，并走一个三页、无重复的分页场景，在 `ccf3931` 上全部通过）。
 - 自动化测试未覆盖的部分：`/memberOf/microsoft.graph.group` 这个转型本身，本轮没有对着真实租户重新验证过（这是一个标准的、有文档记载的 Graph 用法，但本仓没有真实 Graph 租户可供验证——和 `users.py` 里 UPN/manager 那几条记录的盲区是同一类）。见 `docs/tickets/PRD-20393-r2.zh.md` 「自测」一节的「本地盲区」。
+## PRD-20480 · 2026-10-14
+
+- 新工具 `graph_add_group_owner`（`src/graph_mcp/tools/groups.py:71` @ `ad9f0e2`），放在 `graph_assign_groups` 之后。`POST /groups/{id}/owners/$ref`，body 用 `_DIRECTORY_OBJECT_URL`（`graph_assign_groups` 给 `/members/$ref` 用的同一个常量）拼出 `@odata.id`——结构上是同一类端点，只是 owner 而不是 member。完全照搬 `graph_assign_groups` 已有的 400「already exist」处理（`:57-59` 的先例），把结果报成 `already_owner` 而不是错误，和这个工具的幂等标注一致。
+- 没有对 Teams 和普通 M365 组做区分——Microsoft Teams 在 Graph 里就是靠一个 M365 组撑着，所以假定同一个端点对两者都适用。这是设计文档里标出的一条假设，没有在真实的 Teams 背书组上单独验证过。
+- 自身不做任何审批流程——工单原话"Teams 只有经过批准才设为所有者"描述的是一个在调用这个工具**之前**就要完成的 SOP 级步骤；按设计排除在范围之外（见 `docs/tickets/PRD-20480.md` § Non-goals）。
+- 测试覆盖：`tests/test_tools.py::test_graph_add_group_owner_adds_new_owner`、`::test_graph_add_group_owner_is_idempotent_for_existing_owner`（均为本单新增，在 `ad9f0e2` 上全部通过）。
+- 自动化测试未覆盖的部分（需要真实租户——见 `docs/tickets/PRD-20480.md` § 自测，TC-MSG-005b）：Graph 实际的"已是 owner"错误文本是否和 mock 的 400 处理假设一致（和 `graph_assign_groups` 自己当初钉死 `already exist` 匹配时是同一类开放问题）。另外还依赖上面 `users.md` 条目里记的、`graph_create_tap` 同款的 `Group.ReadWrite.All` 跨仓库 scope 授权排期。
