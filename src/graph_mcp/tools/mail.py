@@ -29,12 +29,17 @@ import base64
 import binascii
 import csv
 import datetime as dt
+import hashlib
 import io
 import json
+import logging
 import mimetypes
 import re
 from collections.abc import Callable
 from typing import Annotated, Literal
+from urllib.parse import unquote, urlsplit
+
+import httpx
 
 import xlrd
 from mcp.server.fastmcp import FastMCP
@@ -43,8 +48,11 @@ from openpyxl import load_workbook
 from pydantic import Field
 
 from .._json import MAX_CHARS, dump_json_capped, error_envelope
-from ..api_client import GraphClient, GraphError
+from ..api_client import GraphClient, GraphError, _classify, get_http_client
+from ..config import get_settings
 from ._common import NO_TOKEN, odata_quote
+
+logger = logging.getLogger(__name__)
 
 # Messages carry a bodyPreview each, so a page costs far more characters than
 # a directory listing; 100 is the ceiling and the 20,000-char cap in _json.py
@@ -98,6 +106,12 @@ _USER_ID_DESC = (
 _MAX_ATTACHMENT_BYTES = 500_000
 _MAX_TOTAL_ATTACHMENT_BYTES = 700_000
 _MAX_ATTACHMENTS = 5
+# content_url attachments are fetched here, so they never pass through the
+# agent's context or the gateway's nginx — only Graph's ~4 MB sendMail request
+# limit applies. 2.5 MB decoded is ~3.3 MB of base64, leaving room for the
+# body; the same figure caps all attachments of one mail combined.
+_MAX_URL_ATTACHMENT_BYTES = 2_500_000
+_MAX_MAIL_ATTACHMENT_BYTES = 2_500_000
 
 _ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
 
@@ -120,15 +134,92 @@ def _normalize_base64(value: str) -> str:
     return value + "=" * (-len(value) % 4)
 
 
-def _build_attachments(attachments: list[dict]) -> list[dict] | str:
-    """Validate inline attachments and map them to Graph fileAttachment dicts.
+def _allowed_hosts() -> set[str]:
+    raw = get_settings().attachment_fetch_allowed_hosts
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
 
-    Each attachment carries its bytes as either content_base64 or, for text
-    files (HTML, CSV, TXT, ...), content_text — raw text this server encodes
-    as UTF-8, so the agent never has to base64-encode a file in its context.
 
-    Returns the list, or an invalid_argument envelope string — checked before
-    any request goes out, so a bad attachment never sends a mail without it.
+def _filename_from_response(resp: httpx.Response, url: str) -> str | None:
+    """Name from Content-Disposition (filename* first), else the URL path."""
+    cd = resp.headers.get("content-disposition", "")
+    m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;]+)", cd, re.IGNORECASE)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    tail = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
+    return tail or None
+
+
+async def _fetch_attachment_url(i: int, url: str) -> tuple[bytes, httpx.Response] | str:
+    """GET a content_url from an allow-listed https host, capped in size.
+
+    The agent hands over a link instead of re-typing the file into its tool
+    call — re-typing a 57 KB report is exactly what sent a placeholder in
+    PRD-20707. Any failure returns an envelope and the mail is not sent;
+    nothing is ever substituted for a file that could not be fetched.
+    Redirects are not followed, so the allow-list cannot be stepped around.
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host:
+        return error_envelope(
+            "invalid_argument", f"attachments[{i}] content_url must be an https URL", False
+        )
+    allowed = _allowed_hosts()
+    if host not in allowed:
+        return error_envelope(
+            "invalid_argument",
+            f"attachments[{i}] content_url host '{host}' is not allowed; allowed hosts: "
+            + (", ".join(sorted(allowed)) or "none (content_url is disabled)"),
+            False,
+            {"host": host, "allowed": sorted(allowed)},
+        )
+    try:
+        async with get_http_client().stream("GET", url, follow_redirects=False) as resp:
+            if resp.status_code != 200:
+                code, retryable = _classify(resp.status_code)
+                return error_envelope(
+                    code,
+                    f"attachments[{i}] content_url returned HTTP {resp.status_code}; "
+                    "nothing was sent",
+                    retryable,
+                    {"url": url},
+                )
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes():
+                buf.extend(chunk)
+                if len(buf) > _MAX_URL_ATTACHMENT_BYTES:
+                    return error_envelope(
+                        "invalid_argument",
+                        f"attachments[{i}] content_url is over the "
+                        f"{_MAX_URL_ATTACHMENT_BYTES:,}-byte (2.5 MB) per-file limit; "
+                        "share the link in the body instead",
+                        False,
+                        {"url": url},
+                    )
+            return bytes(buf), resp
+    except httpx.HTTPError as e:
+        return error_envelope(
+            "upstream_error",
+            f"attachments[{i}] content_url could not be fetched: {type(e).__name__}; "
+            "nothing was sent",
+            True,
+            {"url": url},
+        )
+
+
+async def _build_attachments(attachments: list[dict]) -> list[dict] | str:
+    """Validate attachments and map them to Graph fileAttachment dicts.
+
+    Each attachment carries its bytes as exactly one of: content_url — an
+    https link this server downloads (preferred: the agent never re-types
+    the file); content_text — raw text this server encodes as UTF-8; or
+    content_base64.
+
+    Returns the list, or an error envelope string — checked before any
+    request goes out, so a bad attachment never sends a mail without it.
     """
     if len(attachments) > _MAX_ATTACHMENTS:
         return error_envelope(
@@ -137,27 +228,42 @@ def _build_attachments(attachments: list[dict]) -> list[dict] | str:
             False,
         )
     built: list[dict] = []
+    inline_total = 0
     total = 0
     for i, att in enumerate(attachments):
         if not isinstance(att, dict):
             return error_envelope("invalid_argument", f"attachments[{i}] must be an object", False)
-        if not att.get("filename"):
+        has_url = isinstance(att.get("content_url"), str) and att["content_url"].strip() != ""
+        has_b64 = bool(att.get("content_base64"))
+        has_text = isinstance(att.get("content_text"), str) and att["content_text"] != ""
+        filename = att.get("filename")
+        if not filename and not has_url:
             return error_envelope(
                 "invalid_argument", f"attachments[{i}] missing required field 'filename'", False
             )
-        filename = att["filename"]
-        has_b64 = bool(att.get("content_base64"))
-        has_text = isinstance(att.get("content_text"), str) and att["content_text"] != ""
-        if has_b64 == has_text:
+        if has_url + has_b64 + has_text != 1:
             return error_envelope(
                 "invalid_argument",
-                f"attachments[{i}] ('{filename}') needs exactly one of 'content_base64' "
-                "or 'content_text'",
+                f"attachments[{i}] ('{filename or att.get('content_url')}') needs exactly one of "
+                "'content_url', 'content_base64' or 'content_text'",
                 False,
             )
-        if has_text:
+        content_type = att.get("content_type")
+        if has_url:
+            url = att["content_url"].strip()
+            fetched = await _fetch_attachment_url(i, url)
+            if isinstance(fetched, str):
+                return fetched
+            raw, resp = fetched
+            filename = filename or _filename_from_response(resp, url) or "attachment"
+            if not content_type and not mimetypes.guess_type(filename)[0]:
+                content_type = resp.headers.get("content-type", "").split(";")[0].strip() or None
+            content_b64 = base64.b64encode(raw).decode("ascii")
+            source = "url"
+        elif has_text:
             raw = att["content_text"].encode("utf-8")
             content_b64 = base64.b64encode(raw).decode("ascii")
+            source = "inline"
         else:
             if not isinstance(att["content_base64"], str):
                 return error_envelope(
@@ -175,32 +281,47 @@ def _build_attachments(attachments: list[dict]) -> list[dict] | str:
                     "For text files (HTML, CSV, TXT) pass the raw text as content_text instead.",
                     False,
                 )
+            source = "inline"
         size = len(raw)
-        if size > _MAX_ATTACHMENT_BYTES:
-            return error_envelope(
-                "invalid_argument",
-                f"attachment '{filename}' is {size} bytes decoded, exceeds the "
-                f"{_MAX_ATTACHMENT_BYTES:,}-byte (500 KB) per-file limit for inline attachments "
-                "— compress the file or share a link instead",
-                False,
-            )
+        if source == "inline":
+            if size > _MAX_ATTACHMENT_BYTES:
+                return error_envelope(
+                    "invalid_argument",
+                    f"attachment '{filename}' is {size} bytes decoded, exceeds the "
+                    f"{_MAX_ATTACHMENT_BYTES:,}-byte (500 KB) per-file limit for inline "
+                    "attachments — pass it as content_url, compress it, or share a link instead",
+                    False,
+                )
+            inline_total += size
         total += size
+        logger.info(
+            "send_mail attachment[%d] filename=%r bytes=%d sha256=%s source=%s",
+            i, filename, size, hashlib.sha256(raw).hexdigest(), source,
+        )
         built.append(
             {
                 "@odata.type": "#microsoft.graph.fileAttachment",
                 "name": filename,
-                "contentType": att.get("content_type")
+                "contentType": content_type
                 or mimetypes.guess_type(filename)[0]
                 or "application/octet-stream",
                 "contentBytes": content_b64,
             }
         )
-    if total > _MAX_TOTAL_ATTACHMENT_BYTES:
+    if inline_total > _MAX_TOTAL_ATTACHMENT_BYTES:
+        return error_envelope(
+            "invalid_argument",
+            f"inline attachments total {inline_total} bytes decoded, exceeds the "
+            f"{_MAX_TOTAL_ATTACHMENT_BYTES:,}-byte (700 KB) combined limit; "
+            "pass files as content_url, or send fewer/smaller attachments",
+            False,
+        )
+    if total > _MAX_MAIL_ATTACHMENT_BYTES:
         return error_envelope(
             "invalid_argument",
             f"attachments total {total} bytes decoded, exceeds the "
-            f"{_MAX_TOTAL_ATTACHMENT_BYTES:,}-byte (700 KB) combined limit; "
-            "send in multiple emails or fewer/smaller attachments",
+            f"{_MAX_MAIL_ATTACHMENT_BYTES:,}-byte (2.5 MB) per-mail limit; "
+            "send in multiple emails or share links in the body",
             False,
         )
     return built
@@ -402,7 +523,7 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         attachments: Annotated[
             list[dict] | None,
             Field(
-                description='Optional file attachments, up to 5. Each item has "filename" plus exactly one of: "content_text" — the raw text of a text file (HTML, CSV, TXT, JSON, Markdown), encoded server-side, preferred for text files; or "content_base64" — the file bytes as base64, for binary files (PDF, images, Office). e.g. [{"filename": "report.html", "content_text": "<html>...</html>"}, {"filename": "quote.pdf", "content_base64": "JVBERi0x...", "content_type": "application/pdf"}]. content_type defaults to a guess from the filename extension. Max 500 KB per file and 700 KB total, decoded. If any attachment is invalid nothing is sent.'
+                description='Optional file attachments, up to 5. Each item has exactly one of: "content_url" — an https link to the file (e.g. an Agent platform file link like https://agent.mspbots.ai/apps/mb-platform-agent/api/public/files/...), downloaded server-side; ALWAYS use this when the file already has a link, since the exact bytes are fetched and you do not have to repeat the file; "filename" is optional here (taken from the link); or "content_text" — the raw text of a small text file (HTML, CSV, TXT, JSON, Markdown); or "content_base64" — the file bytes as base64, for small binary files. "filename" is required for content_text / content_base64. e.g. [{"content_url": "https://agent.mspbots.ai/apps/mb-platform-agent/api/public/files/..."}, {"filename": "note.txt", "content_text": "hello"}]. content_type defaults to a guess from the filename. Limits: content_url 2.5 MB per file; content_text/content_base64 500 KB per file and 700 KB combined; 2.5 MB per mail. If any attachment is invalid or a link cannot be fetched, nothing is sent.'
             ),
         ] = None,
     ) -> str:
@@ -429,7 +550,7 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         if bcc_recipients:
             message["bccRecipients"] = _addr_list(bcc_recipients)
         if attachments:
-            built = _build_attachments(attachments)
+            built = await _build_attachments(attachments)
             if isinstance(built, str):
                 return built
             message["attachments"] = built
