@@ -70,7 +70,9 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
     )
     async def graph_add_group_owner(
         group_id: Annotated[str, Field(description="Object ID of the group or Team.")],
-        user_id: Annotated[str, Field(description="Object ID of the user to set as owner.")],
+        user_id: Annotated[
+            str, Field(description="Object ID or userPrincipalName of the user to set as owner.")
+        ],
     ) -> str:
         """Add an Entra ID user as an owner of a group or Team.
 
@@ -83,7 +85,21 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
         if client is None:
             return NO_TOKEN
 
-        owner_url = _DIRECTORY_OBJECT_URL.format(user_id=user_id)
+        # PRD-20480 D5: owners/$ref rejects a UPN outright ("Invalid object
+        # identifier"), unlike most other user-facing tools here that accept
+        # either form. Resolve to an object id first so callers can pass a
+        # UPN, same as graph_list_owned_groups already does.
+        try:
+            user = await client.get(f"/users/{user_id}", params={"$select": "id"})
+        except GraphError as e:
+            return e.to_envelope()
+        resolved_id = user.get("id") if isinstance(user, dict) else None
+        if not resolved_id:
+            return error_envelope(
+                "not_found", f"User '{user_id}' could not be resolved to an id.", False
+            )
+
+        owner_url = _DIRECTORY_OBJECT_URL.format(user_id=resolved_id)
 
         try:
             await client.post(
@@ -91,23 +107,20 @@ def register(mcp: FastMCP, client_factory: Callable[[], GraphClient | None]) -> 
                 {"@odata.id": owner_url},
             )
             return dump_json_capped(
-                {"group_id": group_id, "user_id": user_id, "status": "added"}
+                {"group_id": group_id, "user_id": resolved_id, "status": "added"}
             )
         except GraphError as e:
             # Graph returns 400 when the user is already an owner — mirror
             # graph_assign_groups's existing "already exist" handling.
             if e.status_code == 400 and "already exist" in str(e.message).lower():
                 return dump_json_capped(
-                    {"group_id": group_id, "user_id": user_id, "status": "already_owner"}
+                    {"group_id": group_id, "user_id": resolved_id, "status": "already_owner"}
                 )
-            return dump_json_capped(
-                {
-                    "group_id": group_id,
-                    "user_id": user_id,
-                    "status": "error",
-                    "detail": e.message,
-                }
-            )
+            # PRD-20480 D5: every other failure uses the standard envelope
+            # (code/message/retryable) instead of the ad hoc {"status":
+            # "error","detail":...} shape, matching every other tool in
+            # this repo.
+            return e.to_envelope()
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
     async def graph_list_user_groups(
