@@ -26,6 +26,11 @@ def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+def get_http_client() -> httpx.AsyncClient:
+    """The shared pool, for non-Graph fetches (send_mail's content_url)."""
+    return _get_http_client()
+
+
 # status_code -> (error code, retryable). status_code 0 means a network/
 # connection-level failure (no response at all).
 _STATUS_TO_CODE: dict[int, tuple[str, bool]] = {

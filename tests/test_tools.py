@@ -5,6 +5,7 @@ list_tools(), and the error-code mapping is tested directly against
 GraphError, independent of any real HTTP request.
 """
 
+import base64
 import json
 
 import pytest
@@ -917,7 +918,7 @@ async def test_send_mail_requires_exactly_one_content_field(att):
     mcp, client = _mail_mcp({})
     result = await _send(mcp, attachments=[att])
     assert result["error"]["code"] == "invalid_argument"
-    assert "exactly one of 'content_base64' or 'content_text'" in result["error"]["message"]
+    assert "exactly one of 'content_url', 'content_base64' or 'content_text'" in result["error"]["message"]
     assert client.calls == []
 
 
@@ -3242,3 +3243,174 @@ async def test_graph_add_group_owner_is_idempotent_for_existing_owner():
         )[0][0].text
     )
     assert result2 == {"group_id": "g1", "user_id": "u1", "status": "already_owner"}
+
+
+# --- content_url attachments (PRD-20707) ---------------------------------
+
+_PUBLIC_FILE = "https://agent.mspbots.ai/apps/mb-platform-agent/api/public/files/.abc?v=1"
+
+
+@pytest.fixture
+def fetch(monkeypatch):
+    """Route content_url fetches to a MockTransport; returns the request log."""
+    import httpx
+
+    from graph_mcp import api_client
+
+    routes: dict[str, httpx.Response] = {}
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if str(request.url) in routes:
+            return routes[str(request.url)]
+        raise httpx.ConnectError("boom", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(api_client, "_http_client", client)
+    return routes, seen
+
+
+@pytest.mark.asyncio
+async def test_send_mail_content_url_attaches_exact_fetched_bytes(fetch):
+    import httpx
+
+    routes, seen = fetch
+    report = b"<html>" + b"x" * 57_000 + b"</html>"
+    routes[_PUBLIC_FILE] = httpx.Response(
+        200,
+        content=report,
+        headers={
+            "content-type": "text/html",
+            "content-disposition": "inline; filename*=UTF-8''monthly%20report.html",
+        },
+    )
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"content_url": _PUBLIC_FILE}])
+    assert result == {"status": "sent"}
+    assert seen == [_PUBLIC_FILE]
+    assert client.bodies[0]["message"]["attachments"] == [
+        {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": "monthly report.html",
+            "contentType": "text/html",
+            "contentBytes": base64.b64encode(report).decode(),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_mail_content_url_explicit_filename_wins(fetch):
+    import httpx
+
+    routes, _ = fetch
+    routes[_PUBLIC_FILE] = httpx.Response(
+        200, content=b"a,b", headers={"content-disposition": 'attachment; filename="x.bin"'}
+    )
+    mcp, client = _mail_mcp({})
+    await _send(mcp, attachments=[{"content_url": _PUBLIC_FILE, "filename": "data.csv"}])
+    att = client.bodies[0]["message"]["attachments"][0]
+    assert att["name"] == "data.csv"
+    assert att["contentType"] == "text/csv"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example.com/report.html",
+        "http://agent.mspbots.ai/apps/x/report.html",
+        "https://agent.mspbots.ai.evil.com/report.html",
+        "file:///etc/passwd",
+    ],
+)
+async def test_send_mail_content_url_rejects_disallowed_urls_without_fetching(fetch, url):
+    _, seen = fetch
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"content_url": url, "filename": "r.html"}])
+    assert result["error"]["code"] == "invalid_argument"
+    assert seen == []
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_content_url_disabled_when_allow_list_empty(fetch, monkeypatch):
+    monkeypatch.setenv("ATTACHMENT_FETCH_ALLOWED_HOSTS", "")
+    _, seen = fetch
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"content_url": _PUBLIC_FILE}])
+    assert result["error"]["code"] == "invalid_argument"
+    assert "disabled" in result["error"]["message"]
+    assert seen == [] and client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,code,retryable", [(404, "not_found", False), (503, "upstream_error", True), (302, "invalid_argument", False)]
+)
+async def test_send_mail_content_url_fetch_failure_sends_nothing(fetch, status, code, retryable):
+    import httpx
+
+    routes, _ = fetch
+    routes[_PUBLIC_FILE] = httpx.Response(status, headers={"location": "https://evil.example.com/"})
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"content_url": _PUBLIC_FILE}])
+    assert result["error"]["code"] == code
+    assert result["error"]["retryable"] is retryable
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_content_url_network_error_sends_nothing(fetch):
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"content_url": _PUBLIC_FILE}])
+    assert result["error"]["code"] == "upstream_error"
+    assert result["error"]["retryable"] is True
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_content_url_over_per_file_limit(fetch):
+    import httpx
+
+    routes, _ = fetch
+    routes[_PUBLIC_FILE] = httpx.Response(200, content=b"x" * 2_500_001)
+    mcp, client = _mail_mcp({})
+    result = await _send(mcp, attachments=[{"content_url": _PUBLIC_FILE, "filename": "r.html"}])
+    assert result["error"]["code"] == "invalid_argument"
+    assert "2.5 MB" in result["error"]["message"]
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_mail_content_url_not_counted_against_inline_700kb(fetch):
+    import httpx
+
+    routes, _ = fetch
+    routes[_PUBLIC_FILE] = httpx.Response(200, content=b"x" * 2_000_000)
+    mcp, client = _mail_mcp({})
+    result = await _send(
+        mcp,
+        attachments=[
+            {"content_url": _PUBLIC_FILE, "filename": "big.html"},
+            {"filename": "small.txt", "content_text": "hi"},
+        ],
+    )
+    assert result == {"status": "sent"}
+    assert len(client.bodies[0]["message"]["attachments"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_mail_logs_attachment_metadata(fetch, caplog):
+    import hashlib
+    import logging
+
+    import httpx
+
+    routes, _ = fetch
+    routes[_PUBLIC_FILE] = httpx.Response(200, content=b"report")
+    mcp, _ = _mail_mcp({})
+    with caplog.at_level(logging.INFO, logger="graph_mcp.tools.mail"):
+        await _send(mcp, attachments=[{"content_url": _PUBLIC_FILE, "filename": "r.html"}])
+    assert hashlib.sha256(b"report").hexdigest() in caplog.text
+    assert "source=url" in caplog.text
