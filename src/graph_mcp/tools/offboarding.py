@@ -95,9 +95,13 @@ async def _list_all_children(
     other list tools (deliberately single-page-per-call), this tool acts on
     every item in one invocation and does not let the caller resume a list.
     """
+    return await _list_all(client, path, {"$select": select} if select else None)
+
+
+async def _list_all(client: GraphClient, path: str, params: dict | None) -> list[dict]:
+    """Follow @odata.nextLink until the collection is exhausted."""
     items: list[dict] = []
     next_path: str | None = path
-    params: dict | None = {"$select": select} if select else None
     while next_path:
         result = await client.get(next_path, params=params)
         items.extend(result.get("value", []) if isinstance(result, dict) else [])
@@ -133,16 +137,25 @@ async def _discover_cloud_sync_service_principal(client: GraphClient) -> dict | 
     a GraphError envelope -- the caller applies AC10/AC11's distinct
     zero/ambiguous messages.
     """
+    # Every page, not just the first: Graph pages /servicePrincipals at 100
+    # by default and the agent's principal can sit anywhere in a tenant with
+    # more than that. homepage does not support $filter, so the match stays
+    # client-side.
     try:
-        result = await client.get(
+        service_principals = await _list_all(
+            client,
             "/servicePrincipals",
-            params={"$select": "id,homepage,accountEnabled", "$filter": "accountEnabled eq true"},
+            {
+                "$select": "id,homepage,accountEnabled",
+                "$filter": "accountEnabled eq true",
+                "$top": "999",
+            },
         )
     except GraphError as e:
         return e.to_envelope()
     candidates = [
         sp
-        for sp in (result.get("value", []) if isinstance(result, dict) else [])
+        for sp in service_principals
         if _CLOUD_SYNC_AGENT_HOMEPAGE_FRAGMENT in (sp.get("homepage") or "")
     ]
     return {"candidates": candidates}
@@ -150,12 +163,11 @@ async def _discover_cloud_sync_service_principal(client: GraphClient) -> dict | 
 
 async def _discover_cloud_sync_job(client: GraphClient, service_principal_id: str) -> dict | str:
     try:
-        result = await client.get(
-            f"/servicePrincipals/{service_principal_id}/synchronization/jobs"
+        jobs = await _list_all(
+            client, f"/servicePrincipals/{service_principal_id}/synchronization/jobs", None
         )
     except GraphError as e:
         return e.to_envelope()
-    jobs = result.get("value", []) if isinstance(result, dict) else []
     candidates = [
         job
         for job in jobs

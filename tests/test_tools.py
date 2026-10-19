@@ -3074,6 +3074,41 @@ async def test_start_cloud_sync_discovery_is_not_cached_across_tenants():
     assert payload_b["job_id"] == "jobB"
     assert not any("spB" in p or "jobB" in p for p, _ in client_a.get_calls + client_a.post_calls)
     assert not any("spA" in p or "jobA" in p for p, _ in client_b.get_calls + client_b.post_calls)
+
+
+@pytest.mark.asyncio
+async def test_start_cloud_sync_finds_service_principal_past_first_page():
+    """Tenants with more than one page of service principals: the agent's
+    principal on a later page must still be found (only page 1 was read)."""
+    next_link = "https://graph.microsoft.com/v1.0/servicePrincipals?$skiptoken=p2"
+    client = _RoutedClient(
+        get_responses={
+            "/users/u1": {"onPremisesSyncEnabled": True},
+            "/servicePrincipals": {
+                "value": [{"id": f"other{i}", "homepage": None} for i in range(100)],
+                "@odata.nextLink": next_link,
+            },
+            next_link: {
+                "value": [{"id": "sp1", "homepage": "https://x/AD2AADProvisioningAgent"}]
+            },
+            "/servicePrincipals/sp1/synchronization/jobs": {
+                "value": [
+                    {
+                        "id": "job1",
+                        "templateId": "AD2AADProvisioning",
+                        "schedule": {"state": "Active"},
+                    }
+                ]
+            },
+        },
+    )
+    payload = await _call_offboarding(client, "graph_start_cloud_sync", user_id="u1")
+
+    assert payload["status"] == "started"
+    assert payload["service_principal_id"] == "sp1"
+    assert (next_link, {}) in client.get_calls
+
+
 # ---------------------------------------------------------------------------
 # PRD-20480: graph_create_tap, graph_add_group_owner, preferred_language
 # ---------------------------------------------------------------------------
