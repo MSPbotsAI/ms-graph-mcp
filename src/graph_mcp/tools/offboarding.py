@@ -40,15 +40,15 @@ from .._json import dump_json_capped, error_envelope
 from ..api_client import GraphClient, GraphError
 from ._common import NO_TOKEN
 
-# Per Mandy Du's 2026-10-14 comment on PRD-20422 (Rewst GraphQL snapshot of
-# Ginko "08 User Offboarding", 99 workflows, cross-checked against EMD W3):
-# the tenant's Azure AD Connect cloud-sync agent service principal is the
-# one whose `homepage` contains this fragment and is still enabled; its
-# correct synchronization job is the one whose templateId matches it and
-# whose schedule is Active. This is evidence from Rewst's own working
-# implementation, not a guess -- see docs/tickets/PRD-20422.md "Ticket
-# thread" for the full quoted comment.
-_CLOUD_SYNC_AGENT_HOMEPAGE_FRAGMENT = "AD2AADProvisioning"
+# Every Entra Cloud Sync configuration is a service principal instantiated
+# from this application template (Microsoft Learn, "How to programmatically
+# configure cloud sync using MS Graph API"); applicationTemplateId supports
+# $filter eq, so the principal is found without listing the whole tenant.
+# Its synchronization job is the one whose templateId matches below and whose
+# schedule is Active -- the job half of the two-step filter in Rewst's own
+# working subflow (Mandy Du's 2026-10-14 comment on PRD-20422, quoted in
+# docs/tickets/PRD-20422.md "Ticket thread").
+_CLOUD_SYNC_APPLICATION_TEMPLATE_ID = "1a4721b3-e57f-4451-ae87-ef078703ec94"
 _CLOUD_SYNC_JOB_TEMPLATE_ID = "AD2AADProvisioning"
 
 _DEFAULT_ARCHIVE_FOLDER = "Offboarding_Transfer"
@@ -98,12 +98,17 @@ async def _list_all_children(
     return await _list_all(client, path, {"$select": select} if select else None)
 
 
-async def _list_all(client: GraphClient, path: str, params: dict | None) -> list[dict]:
+async def _list_all(
+    client: GraphClient,
+    path: str,
+    params: dict | None,
+    extra_headers: dict[str, str] | None = None,
+) -> list[dict]:
     """Follow @odata.nextLink until the collection is exhausted."""
     items: list[dict] = []
     next_path: str | None = path
     while next_path:
-        result = await client.get(next_path, params=params)
+        result = await client.get(next_path, params=params, extra_headers=extra_headers)
         items.extend(result.get("value", []) if isinstance(result, dict) else [])
         next_path = result.get("@odata.nextLink") if isinstance(result, dict) else None
         params = None  # the nextLink URL already carries its own query string
@@ -137,27 +142,26 @@ async def _discover_cloud_sync_service_principal(client: GraphClient) -> dict | 
     a GraphError envelope -- the caller applies AC10/AC11's distinct
     zero/ambiguous messages.
     """
-    # Every page, not just the first: Graph pages /servicePrincipals at 100
-    # by default and the agent's principal can sit anywhere in a tenant with
-    # more than that. homepage does not support $filter, so the match stays
-    # client-side.
+    # Filter server-side on the template the principal was instantiated from.
+    # Listing every principal and matching homepage locally read only page 1
+    # (100) at first, and walking every page took 90s+ in a tenant with a few
+    # thousand principals; homepage itself does not support $filter.
     try:
-        service_principals = await _list_all(
+        candidates = await _list_all(
             client,
             "/servicePrincipals",
             {
-                "$select": "id,homepage,accountEnabled",
-                "$filter": "accountEnabled eq true",
-                "$top": "999",
+                "$select": "id,displayName,homepage,accountEnabled",
+                "$filter": (
+                    f"applicationTemplateId eq '{_CLOUD_SYNC_APPLICATION_TEMPLATE_ID}' "
+                    "and accountEnabled eq true"
+                ),
+                "$count": "true",
             },
+            extra_headers={"ConsistencyLevel": "eventual"},
         )
     except GraphError as e:
         return e.to_envelope()
-    candidates = [
-        sp
-        for sp in service_principals
-        if _CLOUD_SYNC_AGENT_HOMEPAGE_FRAGMENT in (sp.get("homepage") or "")
-    ]
     return {"candidates": candidates}
 
 

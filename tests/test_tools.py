@@ -2675,11 +2675,13 @@ class _RoutedClient:
         self._post_responses = dict(post_responses or {})
         self._patch_responses = dict(patch_responses or {})
         self.get_calls: list[tuple[str, dict]] = []
+        self.get_headers: list[dict] = []
         self.post_calls: list[tuple[str, dict]] = []
         self.patch_calls: list[tuple[str, dict]] = []
 
     async def get(self, path, params=None, extra_headers=None):
         self.get_calls.append((path, params or {}))
+        self.get_headers.append(extra_headers or {})
         resp = self._get_responses[path]
         if isinstance(resp, GraphError):
             raise resp
@@ -3077,20 +3079,16 @@ async def test_start_cloud_sync_discovery_is_not_cached_across_tenants():
 
 
 @pytest.mark.asyncio
-async def test_start_cloud_sync_finds_service_principal_past_first_page():
-    """Tenants with more than one page of service principals: the agent's
-    principal on a later page must still be found (only page 1 was read)."""
+async def test_start_cloud_sync_filters_service_principals_server_side():
+    """The cloud-sync principal is found by a server-side applicationTemplateId
+    filter, not by listing every principal in the tenant (page 1 only missed
+    it; walking every page took 90s+). A nextLink, if any, is still followed."""
     next_link = "https://graph.microsoft.com/v1.0/servicePrincipals?$skiptoken=p2"
     client = _RoutedClient(
         get_responses={
             "/users/u1": {"onPremisesSyncEnabled": True},
-            "/servicePrincipals": {
-                "value": [{"id": f"other{i}", "homepage": None} for i in range(100)],
-                "@odata.nextLink": next_link,
-            },
-            next_link: {
-                "value": [{"id": "sp1", "homepage": "https://x/AD2AADProvisioningAgent"}]
-            },
+            "/servicePrincipals": {"value": [], "@odata.nextLink": next_link},
+            next_link: {"value": [{"id": "sp1", "displayName": "contoso.com"}]},
             "/servicePrincipals/sp1/synchronization/jobs": {
                 "value": [
                     {
@@ -3106,6 +3104,13 @@ async def test_start_cloud_sync_finds_service_principal_past_first_page():
 
     assert payload["status"] == "started"
     assert payload["service_principal_id"] == "sp1"
+    sp_path, sp_params = client.get_calls[1]
+    assert sp_path == "/servicePrincipals"
+    assert (
+        "applicationTemplateId eq '1a4721b3-e57f-4451-ae87-ef078703ec94'"
+        in sp_params["$filter"]
+    )
+    assert client.get_headers[1] == {"ConsistencyLevel": "eventual"}
     assert (next_link, {}) in client.get_calls
 
 

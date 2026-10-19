@@ -2,6 +2,12 @@
 
 本模块文档的第一条记录——文件本身就是本单新建的。
 
+## Cloud Sync 发现逻辑修复 · 2026-10-19
+
+- `_discover_cloud_sync_service_principal` 改成服务端过滤：`GET /servicePrincipals?$filter=applicationTemplateId eq '1a4721b3-e57f-4451-ae87-ef078703ec94' and accountEnabled eq true`（带 `ConsistencyLevel: eventual` 和 `$count=true`）。每个 Entra Cloud Sync 配置都是从这个应用模板创建的服务主体（Microsoft Learn「How to programmatically configure cloud sync using MS Graph API」），`applicationTemplateId` 支持 `$filter eq`。
+- 取代原来照 Rewst 做的「`homepage` 含 `AD2AADProvisioning`」匹配。`homepage` 不能服务端过滤，只能拉下来本地筛：只读第一页（100 条）时大租户找不到，翻完全部页在 MSPbots 租户要 90 秒以上。同步作业那一步（`templateId == AD2AADProvisioning`、schedule 为 `Active`）不变。
+- 测试：`tests/test_tools.py::test_start_cloud_sync_filters_service_principals_server_side`。
+
 ## PRD-20422 返工 · 2026-10-16
 
 替代下面 2026-10-14 那条里关于 `graph_transfer_onedrive` 的说明；`graph_start_cloud_sync` 没变。

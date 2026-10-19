@@ -2,6 +2,12 @@
 
 First entry in this module doc — the file itself is new, created by this ticket.
 
+## Cloud-sync discovery fix · 2026-10-19
+
+- `_discover_cloud_sync_service_principal` now filters server-side: `GET /servicePrincipals?$filter=applicationTemplateId eq '1a4721b3-e57f-4451-ae87-ef078703ec94' and accountEnabled eq true` (with `ConsistencyLevel: eventual` and `$count=true`). Every Entra Cloud Sync configuration is a service principal instantiated from that template (Microsoft Learn, "How to programmatically configure cloud sync using MS Graph API"), and `applicationTemplateId` supports `$filter eq`.
+- Replaces the Rewst-derived `homepage`-contains-`AD2AADProvisioning` match, which had to be done client-side (`homepage` is not filterable): reading only page 1 (100) missed the principal in larger tenants, and walking every page took 90s+ in the MSPbots tenant. The job half of the filter (`templateId == AD2AADProvisioning`, schedule `Active`) is unchanged.
+- Test: `tests/test_tools.py::test_start_cloud_sync_filters_service_principals_server_side`.
+
 ## PRD-20422 rework · 2026-10-16
 
 Supersedes the `graph_transfer_onedrive` notes in the 2026-10-14 entry below; `graph_start_cloud_sync` is unchanged.
