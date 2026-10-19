@@ -1,0 +1,160 @@
+[
+  {
+    "id": "TC1",
+    "ac": "AC1",
+    "text": "Given a group with fewer members than max_results, When graph_list_group_members is called, Then all members are returned and has_more=false",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_group_members_single_page"]
+  },
+  {
+    "id": "TC2",
+    "ac": "AC1",
+    "text": "Given a group with more members than max_results, When called with that cap, Then exactly max_results members are returned and has_more=true",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_group_members_paginates_and_caps"]
+  },
+  {
+    "id": "TC3",
+    "ac": "AC1",
+    "text": "Given a group_id that does not exist, When graph_list_group_members is called, Then the response is a not_found error envelope, not an empty success",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_group_members_not_found_group"]
+  },
+  {
+    "id": "TC4",
+    "ac": "AC1",
+    "text": "Given a real tenant group with more than one page of members, When walked page by page against the real tenant, Then full membership is reproduced with no duplicates or omissions",
+    "type": "manual",
+    "steps": [
+      "Pick a real Entra ID group in the test tenant known to have more than 50 members (max_results default)",
+      "Call graph_list_group_members(group_id, max_results=50); record returned members and has_more",
+      "If has_more=true, call again walking pages until has_more=false",
+      "Cross-check the combined member list against the group's member count in the Entra admin portal"
+    ],
+    "expect": "Combined member count across pages equals the group's member count shown in the Entra admin portal; no member id repeated across pages",
+    "result": "untested"
+  },
+  {
+    "id": "TC5",
+    "ac": "AC2",
+    "text": "Given a cloud-only group (onPremisesSyncEnabled is None/false), When graph_get_group is called, Then sync_source=\"cloud-only\"",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_get_group_cloud_only_sync_source"]
+  },
+  {
+    "id": "TC6",
+    "ac": "AC2",
+    "text": "Given an AD-synced group (onPremisesSyncEnabled=true), When graph_get_group is called, Then sync_source=\"on-premises\" and onPremisesLastSyncDateTime is present",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_get_group_on_premises_sync_source"]
+  },
+  {
+    "id": "TC7",
+    "ac": "AC2",
+    "text": "Given a group_id that does not exist, When graph_get_group is called, Then the response is a not_found error envelope",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_get_group_not_found"]
+  },
+  {
+    "id": "TC8",
+    "ac": "AC2",
+    "text": "Given one real cloud-only group and, if available, one real AD-synced group, When graph_get_group is called against each, Then returned mailEnabled/sync_source match the Entra admin portal",
+    "type": "manual",
+    "steps": [
+      "Identify a real cloud-only group and (if present in the test tenant) a real AD-synced group",
+      "Call graph_get_group(group_id) for each",
+      "Open the same group in the Entra admin portal and compare mail-enabled state and sync status"
+    ],
+    "expect": "mailEnabled and sync_source (and, for the AD-synced group, onPremisesLastSyncDateTime) match what the Entra admin portal shows",
+    "result": "untested"
+  },
+  {
+    "id": "TC9",
+    "ac": "AC3",
+    "text": "Given a tenant with multiple domains, When graph_list_domains is called, Then every domain is returned with correct isDefault/isVerified/authenticationType flags from the mocked response",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_domains_returns_all_with_flags"]
+  },
+  {
+    "id": "TC10",
+    "ac": "AC3",
+    "text": "Given a Graph response with an empty value array, When graph_list_domains is called, Then the tool returns an empty list, not an error",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_list_domains_empty_tenant"]
+  },
+  {
+    "id": "TC11",
+    "ac": "AC3",
+    "text": "Given the real test tenant, When graph_list_domains is called, Then its output matches the domain list shown in the Entra admin portal",
+    "type": "manual",
+    "steps": [
+      "Call graph_list_domains() against the real test tenant",
+      "Open the Entra admin portal's Domains page for the same tenant",
+      "Compare the two lists domain-by-domain, including isDefault/isVerified flags"
+    ],
+    "expect": "Domain names and flags returned by the tool match the admin portal exactly",
+    "result": "untested"
+  },
+  {
+    "id": "TC12",
+    "ac": "AC4",
+    "text": "Given a user whose proxyAddresses contains a value that is not their primary mail/UPN, When graph_check_user_exists(proxy_address=...) is called, Then exists=true with that user's profile, and the captured Graph request carries ConsistencyLevel: eventual, $count=true, and a correctly odata_quote-escaped $filter",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_check_user_exists_by_proxy_address_match"]
+  },
+  {
+    "id": "TC13",
+    "ac": "AC4",
+    "text": "Given no user has the given proxy address, When called, Then exists=false, not an error",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_check_user_exists_by_proxy_address_no_match"]
+  },
+  {
+    "id": "TC14",
+    "ac": "AC4",
+    "text": "Given zero or two-or-more of user_principal_name/mail/proxy_address are supplied, When graph_check_user_exists is called, Then it returns an invalid_argument error",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_check_user_exists_requires_exactly_one_identifier"]
+  },
+  {
+    "id": "TC15",
+    "ac": "AC4",
+    "text": "Given a proxy_address value containing an apostrophe, When the tool builds its $filter, Then the value is escaped via odata_quote exactly as the existing mail/display_name filters are",
+    "type": "auto",
+    "tests": ["tests/test_tools.py::test_check_user_exists_proxy_address_escapes_quotes"]
+  },
+  {
+    "id": "TC16",
+    "ac": "AC4",
+    "text": "Given a real user in the test tenant with a real secondary proxy address, When graph_check_user_exists(proxy_address=...) is called against that tenant, Then Graph accepts the advanced-query header/filter as documented and returns the expected match",
+    "type": "manual",
+    "steps": [
+      "Identify a real user in the test tenant with a known secondary proxy address (not their primary mail/UPN)",
+      "Call graph_check_user_exists(proxy_address=<that value>) against the real tenant",
+      "Inspect the raw Graph response/status code"
+    ],
+    "expect": "exists=true with the correct user's profile; no 400/403 from Graph on the ConsistencyLevel/advanced-query request shape",
+    "result": "untested"
+  },
+  {
+    "id": "TC17",
+    "ac": "AC5",
+    "text": "Given the four tools are deployed, When a tenant admin opens Capabilities > Connectors > Microsoft Graph > Tools and clicks Refresh Tools, Then all four new tools appear in the connector's tool inventory",
+    "type": "manual",
+    "steps": [
+      "Deploy the updated ms-graph-mcp container with the four new/changed tools",
+      "In agent.mspbots.ai, open Capabilities > Connectors > Microsoft Graph",
+      "Click Refresh Tools on the connector detail view",
+      "Review the Tools list"
+    ],
+    "expect": "graph_list_group_members, graph_get_group, graph_list_domains appear as new entries; graph_check_user_exists's tool description reflects the proxy_address option; no platform-side error or re-authorization prompt appears",
+    "result": "untested"
+  },
+  {
+    "id": "TC18",
+    "ac": "AC1",
+    "text": "Given two sequential calls carrying two different bearer tokens (simulating two tenants), When any of the four new/changed tools is invoked for each, Then each call's outbound Graph request carries only that call's own token, confirming no shared/cached client or cross-tenant leakage",
+    "type": "auto",
+    "tests": ["tests/test_middleware.py::test_header_present_reaches_request_context", "tests/test_tools.py::test_new_tools_use_per_request_client_factory"]
+  }
+]
