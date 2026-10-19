@@ -196,12 +196,18 @@ def test_error_envelope_mapping(status_code, expected_code, expected_retryable):
 class _CapturingClient:
     """Minimal GraphClient stand-in that records the request instead of making it."""
 
-    def __init__(self, result: dict | None = None):
+    def __init__(self, result: dict | None = None, get_result: dict | None = None):
         self.calls: list[tuple[str, dict]] = []
         self.headers: list[dict] = []
         self.bodies: list[dict] = []
         self.methods: list[str] = []
         self._result = result if result is not None else {"value": []}
+        # Separate GET result so a tool that resolves an id via GET before
+        # writing (graph_add_group_owner, PRD-20480 D5) doesn't have the
+        # write-path result bleed into the GET it depends on. None means
+        # "track self._result" (existing tests mutate client._result after
+        # construction and expect GET to see the update).
+        self._get_result = get_result
 
     async def get(
         self,
@@ -212,7 +218,7 @@ class _CapturingClient:
         self.methods.append("GET")
         self.calls.append((path, params or {}))
         self.headers.append(extra_headers or {})
-        return self._result
+        return self._get_result if self._get_result is not None else self._result
 
     async def post(
         self, path: str, body: dict | None = None, extra_headers: dict | None = None
@@ -235,11 +241,13 @@ class _CapturingClient:
         return self._result
 
 
-def _register(module) -> tuple[object, _CapturingClient]:
+def _register(
+    module, result: dict | None = None, get_result: dict | None = None
+) -> tuple[object, _CapturingClient]:
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP(name="test")
-    client = _CapturingClient()
+    client = _CapturingClient(result=result, get_result=get_result)
     module.register(mcp, lambda: client)
     return mcp, client
 
@@ -3228,11 +3236,12 @@ async def test_graph_create_tap_user_not_found_returns_envelope():
 
 @pytest.mark.asyncio
 async def test_graph_add_group_owner_adds_new_owner():
-    """TC-MSG-004/AC6: adding a non-owner must POST .../owners/$ref and
-    report status=added."""
+    """TC-MSG-004/AC6: adding a non-owner must resolve the id (GET
+    /users/{id}?$select=id), then POST .../owners/$ref and report
+    status=added."""
     from graph_mcp.tools import groups
 
-    mcp, client = _register(groups)
+    mcp, client = _register(groups, get_result={"id": "u1", "value": []})
     result = json.loads(
         (
             await mcp.call_tool(
@@ -3241,12 +3250,93 @@ async def test_graph_add_group_owner_adds_new_owner():
         )[0][0].text
     )
 
-    assert client.methods == ["POST"]
-    assert client.calls[0][0] == "/groups/g1/owners/$ref"
+    assert client.methods == ["GET", "POST"]
+    assert client.calls[0] == ("/users/u1", {"$select": "id"})
+    assert client.calls[1][0] == "/groups/g1/owners/$ref"
     assert client.bodies[0] == {
         "@odata.id": "https://graph.microsoft.com/v1.0/directoryObjects/u1"
     }
     assert result == {"group_id": "g1", "user_id": "u1", "status": "added"}
+
+
+@pytest.mark.asyncio
+async def test_graph_add_group_owner_resolves_upn_before_posting():
+    """D5/TC-MSG-004b: a UPN user_id must be resolved to its object id
+    before owners/$ref is called — passed through verbatim, Graph rejects
+    a UPN there with "Invalid object identifier"."""
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(
+        groups, get_result={"id": "11111111-2222-3333-4444-555555555555"}
+    )
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_add_group_owner", {"group_id": "g1", "user_id": "alice@contoso.com"}
+            )
+        )[0][0].text
+    )
+
+    assert client.calls[0] == ("/users/alice@contoso.com", {"$select": "id"})
+    assert client.bodies[0] == {
+        "@odata.id": "https://graph.microsoft.com/v1.0/directoryObjects/"
+        "11111111-2222-3333-4444-555555555555"
+    }
+    assert result == {
+        "group_id": "g1",
+        "user_id": "11111111-2222-3333-4444-555555555555",
+        "status": "added",
+    }
+
+
+@pytest.mark.asyncio
+async def test_graph_add_group_owner_unresolvable_user_returns_not_found_without_posting():
+    """D5: an empty id-lookup result must not fall through to owners/$ref
+    with an empty/garbage id — it must stop and report not_found."""
+    from graph_mcp.tools import groups
+
+    mcp, client = _register(groups, get_result={"value": []})
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_add_group_owner", {"group_id": "g1", "user_id": "ghost@contoso.com"}
+            )
+        )[0][0].text
+    )
+
+    assert client.methods == ["GET"]
+    assert result["error"]["code"] == "not_found"
+    assert result["error"]["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_graph_add_group_owner_user_lookup_error_returns_standard_envelope():
+    """D5: a Graph-side failure resolving the user must surface the
+    standard error envelope, not a raw exception or ad hoc shape."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import groups
+
+    class _UserLookupFailsClient:
+        async def get(self, path: str, params=None, extra_headers=None):
+            raise GraphError(404, "Resource 'bad-user' does not exist.")
+
+        async def post(self, path: str, body=None, extra_headers=None):
+            raise AssertionError("must not POST when the user id cannot be resolved")
+
+    mcp = FastMCP(name="test")
+    groups.register(mcp, lambda: _UserLookupFailsClient())
+
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_add_group_owner", {"group_id": "g1", "user_id": "bad-user"}
+            )
+        )[0][0].text
+    )
+
+    assert result["error"]["code"] == "not_found"
+    assert result["error"]["retryable"] is False
 
 
 @pytest.mark.asyncio
@@ -3258,6 +3348,9 @@ async def test_graph_add_group_owner_is_idempotent_for_existing_owner():
     from graph_mcp.tools import groups
 
     class _AlreadyOwnerClient:
+        async def get(self, path: str, params=None, extra_headers=None):
+            return {"id": "u1"}
+
         async def post(self, path: str, body=None, extra_headers=None):
             raise GraphError(400, "One or more added object references already exist.")
 
@@ -3283,6 +3376,38 @@ async def test_graph_add_group_owner_is_idempotent_for_existing_owner():
         )[0][0].text
     )
     assert result2 == {"group_id": "g1", "user_id": "u1", "status": "already_owner"}
+
+
+@pytest.mark.asyncio
+async def test_graph_add_group_owner_other_post_failure_uses_standard_envelope():
+    """D5: a non-"already exist" POST failure (e.g. insufficient
+    privileges) must come back as the standard error envelope, not the
+    old ad hoc {"status": "error", "detail": ...} shape."""
+    from mcp.server.fastmcp import FastMCP
+
+    from graph_mcp.tools import groups
+
+    class _ForbiddenClient:
+        async def get(self, path: str, params=None, extra_headers=None):
+            return {"id": "u1"}
+
+        async def post(self, path: str, body=None, extra_headers=None):
+            raise GraphError(403, "Insufficient privileges to complete the operation.")
+
+    mcp = FastMCP(name="test")
+    groups.register(mcp, lambda: _ForbiddenClient())
+
+    result = json.loads(
+        (
+            await mcp.call_tool(
+                "graph_add_group_owner", {"group_id": "g1", "user_id": "u1"}
+            )
+        )[0][0].text
+    )
+
+    assert result["error"]["code"] == "unauthorized"
+    assert result["error"]["retryable"] is False
+    assert "Insufficient privileges" in result["error"]["message"]
 
 
 # --- content_url attachments (PRD-20707) ---------------------------------
